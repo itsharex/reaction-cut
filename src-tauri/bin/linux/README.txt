@@ -1,1 +1,1 @@
-Place Linux ffmpeg, ffprobe, and aria2c here.
+Place Linux ffmpeg, ffprobe, aria2c, and BaiduPCS-Go here.

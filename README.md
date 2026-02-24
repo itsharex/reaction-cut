@@ -77,10 +77,20 @@ pnpm dev
 构建与打包：
 
 ```bash
-pnpm tauri build --bundles dmg
+pnpm run tauri:build
 ```
 
 > macOS DMG 生成依赖 `hdiutil`，需在非沙箱环境下执行。
+
+如需指定 bundles，可先执行 `pnpm run install-bins`，再运行 `pnpm exec tauri build --bundles <bundles>`。
+
+Windows 打包（自动拉取二进制，需在 Windows x64 环境执行）：
+
+```bash
+BIN_DOWNLOAD=1 pnpm exec tauri build --bundles nsis,msi
+```
+
+如果已手动准备二进制文件，可用 `BIN_SOURCE_DIR` 指向包含 `ffmpeg`/`ffprobe`/`aria2c`/`BaiduPCS-Go` 的目录。自动拉取默认仅支持 Windows x64。
 
 ## 运行数据位置（macOS）
 
