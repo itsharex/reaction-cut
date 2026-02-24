@@ -16,26 +16,36 @@ const sourceDir = process.env.BIN_SOURCE_DIR || defaultSourceDir;
 const downloadEnabled = isTruthy(process.env.BIN_DOWNLOAD);
 const arch = process.arch;
 
+const BAIDUPCS_VERSION = "v4.0.0";
 const DOWNLOAD_PACKAGES = {
   windows: {
     x64: [
       {
         id: "ffmpeg",
         envKey: "BIN_URL_FFMPEG",
-        url: "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
+        urls: ["https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"],
         provides: ["ffmpeg.exe", "ffprobe.exe"],
       },
       {
         id: "aria2c",
         envKey: "BIN_URL_ARIA2C",
-        url: "https://github.com/aria2/aria2/releases/download/release-1.37.0/aria2-1.37.0-win-64bit-build1.zip",
+        urls: [
+          "https://github.com/aria2/aria2/releases/download/release-1.37.0/aria2-1.37.0-win-64bit-build1.zip",
+        ],
         provides: ["aria2c.exe"],
       },
       {
         id: "baidupcs",
         envKey: "BIN_URL_BAIDUPCS",
-        url: "https://github.com/qjfoidnh/BaiduPCS-Go/releases/download/v4.0.0/BaiduPCS-Go-v4.0.0-windows-amd64.zip",
+        urls: [
+          "https://github.com/qjfoidnh/BaiduPCS-Go/releases/download/v4.0.0/BaiduPCS-Go-v4.0.0-windows-x64.zip",
+        ],
         provides: ["BaiduPCS-Go.exe"],
+        githubRelease: {
+          repo: "qjfoidnh/BaiduPCS-Go",
+          tag: BAIDUPCS_VERSION,
+          assetPattern: /BaiduPCS-Go-.*windows.*(amd64|x64).*\.zip$/i,
+        },
       },
     ],
   },
@@ -107,12 +117,84 @@ function downloadFile(url, targetPath) {
   });
 }
 
+function fetchJson(url) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(
+      url,
+      {
+        headers: {
+          "User-Agent": "reaction-cut-rust/install-bins",
+          Accept: "application/vnd.github+json",
+          ...(process.env.GITHUB_TOKEN ? { Authorization: `Bearer ${process.env.GITHUB_TOKEN}` } : {}),
+        },
+      },
+      (res) => {
+        if (res.statusCode !== 200) {
+          reject(new Error(`请求失败: ${url} status=${res.statusCode}`));
+          res.resume();
+          return;
+        }
+        let data = "";
+        res.setEncoding("utf8");
+        res.on("data", (chunk) => {
+          data += chunk;
+        });
+        res.on("end", () => {
+          try {
+            resolve(JSON.parse(data));
+          } catch (error) {
+            reject(error);
+          }
+        });
+      },
+    );
+    req.on("error", reject);
+  });
+}
+
+async function resolveGithubAssetUrl(release) {
+  const apiUrl = `https://api.github.com/repos/${release.repo}/releases/tags/${release.tag}`;
+  const data = await fetchJson(apiUrl);
+  const assets = Array.isArray(data?.assets) ? data.assets : [];
+  const match = assets.find((asset) => release.assetPattern.test(asset.name));
+  if (!match) {
+    throw new Error(`未找到匹配的发行包: ${release.repo}@${release.tag}`);
+  }
+  return match.browser_download_url;
+}
+
 async function downloadPackage(pkg, targetDir) {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "reaction-cut-bins-"));
   try {
-    const url = process.env[pkg.envKey] || pkg.url;
+    const candidateUrls = [];
+    const overrideUrl = process.env[pkg.envKey];
+    if (overrideUrl) {
+      candidateUrls.push(overrideUrl);
+    }
+    if (Array.isArray(pkg.urls)) {
+      candidateUrls.push(...pkg.urls);
+    }
+    let downloaded = false;
     const zipPath = path.join(tempDir, `${pkg.id}.zip`);
-    await downloadFile(url, zipPath);
+    for (const url of candidateUrls) {
+      try {
+        await downloadFile(url, zipPath);
+        downloaded = true;
+        break;
+      } catch (error) {
+        if (overrideUrl) {
+          throw error;
+        }
+      }
+    }
+    if (!downloaded && pkg.githubRelease) {
+      const url = await resolveGithubAssetUrl(pkg.githubRelease);
+      await downloadFile(url, zipPath);
+      downloaded = true;
+    }
+    if (!downloaded) {
+      throw new Error(`下载失败: ${pkg.id}，可使用 ${pkg.envKey} 指定下载地址`);
+    }
     await extract(zipPath, { dir: tempDir });
     for (const name of pkg.provides) {
       const sourcePath = findFile(tempDir, name);
