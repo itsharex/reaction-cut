@@ -16,7 +16,7 @@ use crate::api::ApiResponse;
 use crate::app_log;
 use crate::baidu_sync;
 use crate::config;
-use crate::utils::{append_log, now_rfc3339};
+use crate::utils::{append_log, apply_no_window, now_rfc3339};
 use crate::AppState;
 
 #[derive(Deserialize)]
@@ -400,6 +400,7 @@ pub fn baidu_sync_account_login_start(
   }
 
   let mut command = Command::new(&exec_path);
+  apply_no_window(&mut command);
   if !config_dir.is_empty() {
     command.env("BAIDUPCS_GO_CONFIG_DIR", &config_dir);
   }

@@ -5,6 +5,7 @@ use std::process::{Command, Stdio};
 
 use crate::config::resolve_ffprobe_path;
 use crate::ffmpeg::{run_ffmpeg, run_ffprobe_json};
+use crate::utils::apply_no_window;
 
 const START_DIFF_THRESHOLD_SECONDS: f64 = 1.0;
 const TIMESTAMP_GAP_THRESHOLD_SECONDS: f64 = 2.0;
@@ -101,6 +102,14 @@ struct ClipTranscodeProfile {
   width: i64,
   height: i64,
   normalize_video: bool,
+}
+
+fn clip_video_encoder() -> &'static str {
+  if cfg!(target_os = "macos") {
+    "h264_videotoolbox"
+  } else {
+    "libx264"
+  }
 }
 
 fn parse_fraction(value: &str) -> Option<f64> {
@@ -420,6 +429,7 @@ pub fn parse_time_to_seconds(value: &str) -> Option<f64> {
 fn scan_timestamp_gaps(path: &Path, interval: Option<String>) -> Result<TimestampScanResult, String> {
   let ffprobe_path = resolve_ffprobe_path();
   let mut command = Command::new(ffprobe_path);
+  apply_no_window(&mut command);
   command
     .arg("-v")
     .arg("error")
@@ -669,7 +679,7 @@ fn clip_single(
       args.push("aresample=48000:async=1:first_pts=0".to_string());
       args.extend([
         "-c:v".to_string(),
-        "h264_videotoolbox".to_string(),
+        clip_video_encoder().to_string(),
         "-b:v".to_string(),
         "5M".to_string(),
         "-c:a".to_string(),

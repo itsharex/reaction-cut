@@ -22,7 +22,7 @@ use crate::config::{default_download_dir, resolve_aria2c_candidates};
 use crate::commands::settings::load_download_settings_from_db;
 use crate::ffmpeg::{run_ffmpeg, run_ffmpeg_with_progress, run_ffprobe_json};
 use crate::login_store::AuthInfo;
-use crate::utils::{append_log, build_output_path, now_rfc3339, sanitize_filename};
+use crate::utils::{append_log, apply_no_window, build_output_path, now_rfc3339, sanitize_filename};
 use crate::bilibili::client::BilibiliClient;
 use crate::db::Db;
 use crate::login_store::LoginStore;
@@ -2819,7 +2819,9 @@ fn run_aria2c_with_path<F>(
 where
   F: FnMut(u64, u64),
 {
-  let mut child = Command::new(path)
+  let mut command = Command::new(path);
+  apply_no_window(&mut command);
+  let mut child = command
     .args(args)
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())

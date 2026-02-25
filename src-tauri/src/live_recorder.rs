@@ -30,7 +30,7 @@ use crate::db::Db;
 use crate::ffmpeg::run_ffmpeg;
 use crate::login_store::{AuthInfo, LoginStore};
 use crate::baidu_sync;
-use crate::utils::{append_log, now_rfc3339, sanitize_filename};
+use crate::utils::{append_log, apply_no_window, now_rfc3339, sanitize_filename};
 
 pub struct LiveRuntime {
   records: Mutex<HashMap<String, LiveRecordHandle>>,
@@ -2309,7 +2309,9 @@ fn record_hls_stream(
     file_path.to_string(),
   ];
 
-  let mut child = Command::new(resolve_ffmpeg_path())
+  let mut command = Command::new(resolve_ffmpeg_path());
+  apply_no_window(&mut command);
+  let mut child = command
     .args(&args)
     .stdin(Stdio::piped())
     .stderr(Stdio::piped())

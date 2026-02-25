@@ -4,10 +4,13 @@ use std::process::{Command, Stdio};
 use serde_json::Value;
 
 use crate::config::{resolve_ffmpeg_path, resolve_ffprobe_path};
+use crate::utils::apply_no_window;
 
 pub fn run_ffmpeg(args: &[String]) -> Result<(), String> {
   let ffmpeg_path = resolve_ffmpeg_path();
-  let output = Command::new(ffmpeg_path)
+  let mut command = Command::new(ffmpeg_path);
+  apply_no_window(&mut command);
+  let output = command
     .args(args)
     .output()
     .map_err(|err| format!("Failed to start FFmpeg: {}", err))?;
@@ -29,7 +32,9 @@ where
   F: FnMut(i64),
 {
   let ffmpeg_path = resolve_ffmpeg_path();
-  let mut child = Command::new(ffmpeg_path)
+  let mut command = Command::new(ffmpeg_path);
+  apply_no_window(&mut command);
+  let mut child = command
     .args(args)
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())
@@ -99,7 +104,9 @@ where
 
 pub fn run_ffprobe_json(args: &[String]) -> Result<Value, String> {
   let ffprobe_path = resolve_ffprobe_path();
-  let output = Command::new(ffprobe_path)
+  let mut command = Command::new(ffprobe_path);
+  apply_no_window(&mut command);
+  let output = command
     .args(args)
     .output()
     .map_err(|err| format!("Failed to start FFprobe: {}", err))?;

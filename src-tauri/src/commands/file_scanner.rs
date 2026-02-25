@@ -6,6 +6,7 @@ use serde::Serialize;
 
 use crate::api::ApiResponse;
 use crate::config::{default_download_dir, resolve_ffmpeg_path};
+use crate::utils::apply_no_window;
 
 #[derive(Serialize)]
 pub struct FileEntry {
@@ -99,7 +100,9 @@ pub fn video_duration(path: String) -> ApiResponse<i64> {
   }
 
   let ffmpeg_path = resolve_ffmpeg_path();
-  let output = match Command::new(ffmpeg_path).arg("-i").arg(trimmed).output() {
+  let mut command = Command::new(ffmpeg_path);
+  apply_no_window(&mut command);
+  let output = match command.arg("-i").arg(trimmed).output() {
     Ok(output) => output,
     Err(err) => return ApiResponse::error(format!("Failed to start FFmpeg: {}", err)),
   };

@@ -11,7 +11,7 @@ use tokio::time::{sleep, Duration};
 use crate::commands::settings::DEFAULT_BAIDU_MAX_PARALLEL;
 use crate::config::resolve_baidu_pcs_path;
 use crate::db::Db;
-use crate::utils::{append_log, now_rfc3339, sanitize_filename};
+use crate::utils::{append_log, apply_no_window, now_rfc3339, sanitize_filename};
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1567,7 +1567,9 @@ struct CommandOutput {
 }
 
 fn run_baidu_pcs_command(exec_path: &Path, args: &[String]) -> Result<CommandOutput, String> {
-  let output = Command::new(exec_path)
+  let mut command = Command::new(exec_path);
+  apply_no_window(&mut command);
+  let output = command
     .args(args)
     .output()
     .map_err(|err| format!("BaiduPCS-Go 执行失败: {}", err))?;
@@ -1592,7 +1594,9 @@ where
   F: FnOnce(Arc<Mutex<Child>>),
 {
   let save_dir = local_dir.to_string_lossy().to_string();
-  let mut child = Command::new(exec_path)
+  let mut command = Command::new(exec_path);
+  apply_no_window(&mut command);
+  let mut child = command
     .current_dir(local_dir)
     .args([
       "download".to_string(),
@@ -1669,7 +1673,9 @@ fn run_baidu_pcs_upload<F>(
 where
   F: FnMut(f64),
 {
-  let mut child = Command::new(exec_path)
+  let mut command = Command::new(exec_path);
+  apply_no_window(&mut command);
+  let mut child = command
     .args(args)
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())
