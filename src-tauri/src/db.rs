@@ -26,17 +26,6 @@ impl Db {
 
     let conn = Connection::open(db_path)?;
     let _ = conn.execute("ALTER TABLE task_output_segment ADD COLUMN merged_id INTEGER", []);
-    conn.execute_batch(include_str!("db/schema.sql"))?;
-    let _ = conn.execute(
-      "INSERT OR IGNORE INTO app_settings (key, value, updated_at) \
-       VALUES ('baidu_sync_concurrency', '3', datetime('now'))",
-      [],
-    );
-    let _ = conn.execute(
-      "UPDATE app_settings SET value = '3', updated_at = datetime('now') \
-       WHERE key = 'baidu_sync_concurrency' AND value = '1'",
-      [],
-    );
     let _ = conn.execute("ALTER TABLE live_settings ADD COLUMN record_path TEXT", []);
     let _ = conn.execute(
       "ALTER TABLE live_settings ADD COLUMN baidu_sync_enabled INTEGER DEFAULT 0",
@@ -119,6 +108,17 @@ impl Db {
       [],
     );
     let _ = conn.execute("ALTER TABLE baidu_sync_task ADD COLUMN baidu_uid TEXT", []);
+    conn.execute_batch(include_str!("db/schema.sql"))?;
+    let _ = conn.execute(
+      "INSERT OR IGNORE INTO app_settings (key, value, updated_at) \
+       VALUES ('baidu_sync_concurrency', '3', datetime('now'))",
+      [],
+    );
+    let _ = conn.execute(
+      "UPDATE app_settings SET value = '3', updated_at = datetime('now') \
+       WHERE key = 'baidu_sync_concurrency' AND value = '1'",
+      [],
+    );
 
     Ok(Self {
       conn: Mutex::new(conn),

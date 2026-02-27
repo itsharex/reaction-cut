@@ -78,8 +78,13 @@ jobs:
         if: matrix.os == 'macos-latest'
         run: pnpm run install-bins
 
-      - name: Build bundles
-        run: pnpm exec tauri build --bundles ${{ matrix.os == 'windows-latest' && 'nsis,msi' || 'dmg' }}
+      - name: Build bundles (Windows)
+        if: matrix.os == 'windows-latest'
+        run: pnpm exec tauri build --config src-tauri/tauri.windows.conf.json --bundles nsis,msi
+
+      - name: Build bundles (macOS)
+        if: matrix.os == 'macos-latest'
+        run: pnpm exec tauri build --config src-tauri/tauri.macos.conf.json --bundles dmg
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
