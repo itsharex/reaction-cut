@@ -77,6 +77,7 @@ pub struct BaiduSyncUpdateRequest {
 pub struct BaiduRemoteEntry {
   pub name: String,
   pub path: String,
+  pub is_dir: bool,
 }
 
 #[derive(Deserialize)]
@@ -227,6 +228,30 @@ pub fn baidu_sync_remote_dirs(
         .map(|item| BaiduRemoteEntry {
           name: item.name,
           path: item.path,
+          is_dir: true,
+        })
+        .collect(),
+    ),
+    Err(err) => ApiResponse::error(err),
+  }
+}
+
+#[tauri::command]
+pub fn baidu_sync_remote_entries(
+  state: State<'_, AppState>,
+  request: Option<BaiduRemoteListRequest>,
+) -> ApiResponse<Vec<BaiduRemoteEntry>> {
+  let path = request
+    .and_then(|value| value.path)
+    .unwrap_or_else(|| "/".to_string());
+  match baidu_sync::list_baidu_remote_entries(&state.db, &path) {
+    Ok(list) => ApiResponse::success(
+      list
+        .into_iter()
+        .map(|item| BaiduRemoteEntry {
+          name: item.name,
+          path: item.path,
+          is_dir: item.is_dir,
         })
         .collect(),
     ),
@@ -249,6 +274,7 @@ pub fn baidu_sync_create_dir(
     Ok(entry) => ApiResponse::success(BaiduRemoteEntry {
       name: entry.name,
       path: entry.path,
+      is_dir: true,
     }),
     Err(err) => ApiResponse::error(err),
   }
@@ -273,6 +299,7 @@ pub fn baidu_sync_rename_dir(
     Ok(entry) => ApiResponse::success(BaiduRemoteEntry {
       name: entry.name,
       path: entry.path,
+      is_dir: true,
     }),
     Err(err) => ApiResponse::error(err),
   }

@@ -44,7 +44,7 @@ export default function SettingsSection() {
     checkIntervalSec: 180,
     flvFixSplitOnMissing: false,
     flvFixAdjustTimestampJump: true,
-    flvFixSplitOnTimestampJump: true,
+    flvFixSplitOnTimestampJump: false,
     flvFixDisableOnAnnexb: false,
     baiduSyncEnabled: false,
     baiduSyncPath: "/录播",

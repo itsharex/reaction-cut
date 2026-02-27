@@ -389,7 +389,7 @@ CREATE TABLE IF NOT EXISTS live_settings (
   check_interval_sec INTEGER NOT NULL,
   flv_fix_split_on_missing INTEGER NOT NULL,
   flv_fix_adjust_timestamp_jump INTEGER NOT NULL DEFAULT 1,
-  flv_fix_split_on_timestamp_jump INTEGER NOT NULL DEFAULT 1,
+  flv_fix_split_on_timestamp_jump INTEGER NOT NULL DEFAULT 0,
   flv_fix_disable_on_annexb INTEGER NOT NULL,
   baidu_sync_enabled INTEGER NOT NULL DEFAULT 0,
   baidu_sync_path TEXT,

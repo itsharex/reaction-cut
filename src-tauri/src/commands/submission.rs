@@ -387,6 +387,14 @@ pub struct SubmissionDeleteRequest {
   pub force_delete: bool,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmissionBindMergedRemoteRequest {
+  pub task_id: String,
+  pub merged_id: i64,
+  pub remote_path: String,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskCreationResult {
@@ -4860,6 +4868,97 @@ pub fn submission_detail(
 }
 
 #[tauri::command]
+pub fn submission_bind_merged_remote_file(
+  state: State<'_, AppState>,
+  request: SubmissionBindMergedRemoteRequest,
+) -> ApiResponse<String> {
+  let context = SubmissionContext::new(&state);
+  let task_id = request.task_id.trim().to_string();
+  if task_id.is_empty() {
+    return ApiResponse::error("任务ID不能为空");
+  }
+  if request.merged_id <= 0 {
+    return ApiResponse::error("合并视频ID无效");
+  }
+  let remote_path = request.remote_path.trim().to_string();
+  if remote_path.is_empty() {
+    return ApiResponse::error("网盘路径不能为空");
+  }
+  let (remote_dir, remote_name) = match split_baidu_path(&remote_path) {
+    Some(value) => value,
+    None => return ApiResponse::error("网盘路径格式无效"),
+  };
+  let current_bilibili_uid = match require_current_bilibili_uid(&state) {
+    Ok(value) => value,
+    Err(err) => return ApiResponse::error(err),
+  };
+  let current_baidu_uid = match require_logged_baidu_uid(context.db.as_ref()) {
+    Ok(value) => value,
+    Err(err) => return ApiResponse::error(err),
+  };
+
+  let task_owner = context.db.with_conn(|conn| {
+    conn
+      .query_row(
+        "SELECT bilibili_uid FROM submission_task WHERE task_id = ?1",
+        [&task_id],
+        |row| row.get::<_, Option<i64>>(0),
+      )
+      .optional()
+  });
+  let task_owner = match task_owner {
+    Ok(Some(value)) => value,
+    Ok(None) => return ApiResponse::error("投稿任务不存在"),
+    Err(err) => return ApiResponse::error(format!("读取投稿任务失败: {}", err)),
+  };
+  if task_owner != Some(current_bilibili_uid) {
+    return ApiResponse::error("当前账号无权绑定该投稿任务");
+  }
+
+  let merged_exists = context.db.with_conn(|conn| {
+    conn
+      .query_row(
+        "SELECT 1 FROM merged_video WHERE id = ?1 AND task_id = ?2",
+        (request.merged_id, &task_id),
+        |_| Ok(()),
+      )
+      .optional()
+  });
+  match merged_exists {
+    Ok(Some(())) => {}
+    Ok(None) => return ApiResponse::error("合并视频不存在"),
+    Err(err) => return ApiResponse::error(format!("读取合并视频失败: {}", err)),
+  }
+
+  let now = now_rfc3339();
+  let update_result = context.db.with_conn(|conn| {
+    conn.execute(
+      "UPDATE merged_video SET remote_dir = ?1, remote_name = ?2, baidu_uid = ?3, update_time = ?4 \
+       WHERE id = ?5 AND task_id = ?6",
+      (
+        &remote_dir,
+        &remote_name,
+        &current_baidu_uid,
+        &now,
+        request.merged_id,
+        &task_id,
+      ),
+    )?;
+    conn.execute(
+      "UPDATE baidu_sync_task SET baidu_uid = ?1, remote_dir = ?2, remote_name = ?3, updated_at = ?4 \
+       WHERE source_type = 'submission_merged' AND source_id = ?5 AND status IN ('PENDING', 'FAILED', 'PAUSED', 'CANCELLED')",
+      (&current_baidu_uid, &remote_dir, &remote_name, &now, &task_id),
+    )?;
+    Ok(())
+  });
+  if let Err(err) = update_result {
+    return ApiResponse::error(format!("绑定网盘文件失败: {}", err));
+  }
+
+  ApiResponse::success("OK".to_string())
+}
+
+#[tauri::command]
 pub fn submission_edit_prepare(
   state: State<'_, AppState>,
   task_id: String,
@@ -5597,7 +5696,13 @@ pub fn submission_delete(
         Ok(metadata) => metadata.is_file(),
         Err(err) => return ApiResponse::error(format!("读取路径失败: {}", err)),
       };
-      if let Err(err) = remove_path_if_exists(&state.app_log_path, "custom", target) {
+      if let Err(err) = remove_path_if_exists_with_retry(
+        &state.app_log_path,
+        "custom",
+        target,
+        5,
+        Duration::from_millis(300),
+      ) {
         return ApiResponse::error(err);
       }
       deleted_paths.push(path.to_string());
@@ -7121,7 +7226,8 @@ fn load_task_detail(
       ),
     );
   }
-  context
+  let path_prefix = load_local_path_prefix(context.db.as_ref());
+  let mut detail = context
     .db
     .with_conn(|conn| {
       let task = conn.query_row(
@@ -7138,7 +7244,7 @@ fn load_task_detail(
       let mut source_stmt = conn.prepare(
         "SELECT id, task_id, source_file_path, sort_order, start_time, end_time FROM task_source_video WHERE task_id = ?1 ORDER BY sort_order ASC",
       )?;
-      let mut source_videos = source_stmt
+      let source_videos = source_stmt
         .query_map([task_id], |row| {
           Ok(TaskSourceVideoRecord {
             id: row.get(0)?,
@@ -7157,7 +7263,7 @@ fn load_task_detail(
                 upload_endpoint, upload_auth, upload_uri, upload_chunk_size, upload_last_part_index \
          FROM task_output_segment WHERE task_id = ?1 ORDER BY part_order ASC",
       )?;
-      let mut output_segments = segment_stmt
+      let output_segments = segment_stmt
         .query_map([task_id], |row| {
           Ok(TaskOutputSegmentRecord {
             segment_id: row.get(0)?,
@@ -7190,7 +7296,7 @@ fn load_task_detail(
                 upload_last_part_index, create_time, update_time \
          FROM merged_video WHERE task_id = ?1 ORDER BY create_time DESC, id DESC",
       )?;
-      let mut merged_videos = merged_stmt
+      let merged_videos = merged_stmt
         .query_map([task_id], |row| {
           Ok(MergedVideoRecord {
             id: row.get(0)?,
@@ -7219,16 +7325,6 @@ fn load_task_detail(
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
-      for source in &mut source_videos {
-        source.source_file_path = to_runtime_submission_path(context, &source.source_file_path);
-      }
-      for segment in &mut output_segments {
-        segment.segment_file_path = to_runtime_submission_path(context, &segment.segment_file_path);
-      }
-      for merged in &mut merged_videos {
-        merged.video_path = to_runtime_submission_path_opt(context, merged.video_path.clone());
-      }
-
       let workflow_config_raw: Option<String> = conn
         .query_row(
           "SELECT wc.configuration_data FROM workflow_instances wi \
@@ -7249,7 +7345,30 @@ fn load_task_detail(
         workflow_config,
       })
     })
-    .map_err(|err| err.to_string())
+    .map_err(|err| err.to_string())?;
+
+  for source in &mut detail.source_videos {
+    let path = to_absolute_local_path_with_prefix(path_prefix.as_path(), &source.source_file_path);
+    source.source_file_path = if path.as_os_str().is_empty() {
+      String::new()
+    } else {
+      path.to_string_lossy().to_string()
+    };
+  }
+  for segment in &mut detail.output_segments {
+    let path = to_absolute_local_path_with_prefix(path_prefix.as_path(), &segment.segment_file_path);
+    segment.segment_file_path = if path.as_os_str().is_empty() {
+      String::new()
+    } else {
+      path.to_string_lossy().to_string()
+    };
+  }
+  for merged in &mut detail.merged_videos {
+    merged.video_path =
+      to_absolute_local_path_opt_with_prefix(path_prefix.as_path(), merged.video_path.clone());
+  }
+
+  Ok(detail)
 }
 
 pub fn create_workflow_instance_for_task_with_type(

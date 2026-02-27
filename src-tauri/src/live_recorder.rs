@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
@@ -85,6 +86,10 @@ const TIMESTAMP_VIDEO_FALLBACK_MS: i64 = 33;
 const TIMESTAMP_VIDEO_MIN_STEP_MS: i64 = 15;
 const TIMESTAMP_VIDEO_MAX_STEP_MS: i64 = 50;
 const TIMESTAMP_MIN_STEP_MS: i64 = 1;
+const REMUX_SUSPECT_SOURCE_MIN_BYTES: u64 = 100 * 1024 * 1024;
+const REMUX_SUSPECT_RATIO_NUM: u64 = 1;
+const REMUX_SUSPECT_RATIO_DEN: u64 = 10;
+const REMUX_MIN_VALID_OUTPUT_BYTES: u64 = 2 * 1024 * 1024;
 
 pub fn new_live_runtime() -> LiveRuntime {
   LiveRuntime {
@@ -736,10 +741,15 @@ fn run_record_loop(
   let mut stream_urls: Vec<String> = Vec::new();
   let mut stream_url_index: usize = 0;
   let mut force_no_qn_until: Option<i64> = None;
-  let mut timestamp_fixer = TimestampFixer::new(
+  let mut pipeline = LiveFlvPipeline::new(
+    LivePipelineSettings {
+      split_on_script_tag: false,
+      disable_split_on_h264_annexb: settings.flv_fix_disable_on_annexb,
+    },
     enable_timestamp_fix,
     settings.flv_fix_adjust_timestamp_jump,
   );
+  let mut disconnect_retries: usize = 0;
 
   loop {
     if stop_flag.load(Ordering::SeqCst) {
@@ -980,10 +990,6 @@ fn run_record_loop(
     let mut buf = vec![0u8; 8192];
     let mut parser = FlvStreamParser::new();
     let mut cache = FlvHeaderCache::new();
-    let mut last_tag_timestamp: Option<u32> = None;
-    let mut stagnant_count: usize = 0;
-    let mut last_progress_at = Instant::now();
-
     loop {
       if stop_flag.load(Ordering::SeqCst) {
         if let Some(mut seg) = segment.take() {
@@ -1000,30 +1006,27 @@ fn run_record_loop(
         Ok(0) => {
           let missing_since = missing_started_at.get_or_insert_with(Instant::now);
           let missing_elapsed = missing_since.elapsed().as_secs();
-          let should_split = settings.flv_fix_split_on_missing && !settings.flv_fix_disable_on_annexb;
-          let force_split = should_split || missing_elapsed >= MISSING_SEGMENT_WINDOW_SECS;
-          if force_split {
-            if let Some(mut seg) = segment.take() {
-              let record_id = seg.record_id;
-              let file_path = seg.file_path.clone();
-              seg.finish("COMPLETED", Some("网络中断自动分段"))?;
-              drop(seg);
-              spawn_segment_remux(context.clone(), record_id, file_path);
-            }
-            segment_index += 1;
-            pending_title = None;
-            pending_split = false;
-            missing_started_at = None;
-            current_title = load_current_title(&context, &room_id, &current_title);
-            current_file_path = build_record_path(
-              &settings.file_name_template,
-              &base_dir,
-              &room_info,
-              nickname.as_deref(),
-              &record_start_date,
-              segment_index,
+          if missing_elapsed >= MISSING_SEGMENT_WINDOW_SECS {
+            disconnect_retries += 1;
+            append_log(
+              &context.app_log_path,
+              &format!(
+                "stream_read_end_disconnect room={} elapsed={} retry={}",
+                room_id, missing_elapsed, disconnect_retries
+              ),
             );
-            update_current_file(&context, &room_id, &current_file_path);
+            stream_urls.clear();
+            if disconnect_retries >= 3 {
+              if let Some(mut seg) = segment.take() {
+                let record_id = seg.record_id;
+                let file_path = seg.file_path.clone();
+                seg.finish("FAILED", Some("流断开超过阈值，录制会话终止"))?;
+                drop(seg);
+                spawn_segment_remux(context.clone(), record_id, file_path);
+              }
+              return Err("直播流中断超过阈值".to_string());
+            }
+            std::thread::sleep(Duration::from_millis(settings.stream_retry_ms.max(1000) as u64));
             break;
           }
           append_log(
@@ -1060,10 +1063,12 @@ fn run_record_loop(
           };
 
           let mut invalid_stream = false;
+          let mut invalid_reason: Option<String> = None;
           for item in items {
             match item {
               FlvParsedItem::Header(header) => {
                 cache.set_header(header.clone());
+                pipeline.on_stream_header();
                 if segment.is_none() {
                   let mut new_segment = open_segment(
                     &context,
@@ -1076,28 +1081,41 @@ fn run_record_loop(
                     nickname.as_deref(),
                   )?;
                   cache.write_preamble(&mut new_segment)?;
-                  timestamp_fixer.reset();
+                  pipeline.reset_on_new_segment();
                   segment_start = Instant::now();
                   segment = Some(new_segment);
                 }
               }
               FlvParsedItem::Tag(mut tag) => {
-                if enable_timestamp_fix {
-                  let is_header_tag = tag.tag_type == 18
-                    || is_audio_header_tag(tag.data())
-                    || is_video_header_tag(tag.data());
-                  if let Some(jump) = timestamp_fixer.fix_tag(&mut tag, is_header_tag) {
-                    append_log(
-                      &context.app_log_path,
-                      &format!(
-                        "stream_timestamp_jump room={} diff={} original={} fixed={} offset={}",
-                        room_id, jump.diff, jump.original, jump.fixed, jump.offset
-                      ),
-                    );
-                    if settings.flv_fix_split_on_timestamp_jump {
-                      pending_split = true;
-                    }
-                  }
+                let mut decision = pipeline.process_tag(&mut tag);
+                for line in decision.logs.drain(..) {
+                  append_log(
+                    &context.app_log_path,
+                    &format!("stream_pipeline room={} {}", room_id, line),
+                  );
+                }
+                if let Some(reason) = decision.request_split {
+                  pending_split = true;
+                  append_log(
+                    &context.app_log_path,
+                    &format!("stream_pipeline_split room={} reason={}", room_id, reason),
+                  );
+                }
+                if let Some(reason) = decision.disconnect_reason.take() {
+                  append_log(
+                    &context.app_log_path,
+                    &format!("stream_pipeline_disconnect room={} reason={}", room_id, reason),
+                  );
+                  mark_force_no_qn(
+                    &mut force_no_qn_until,
+                    &settings,
+                    context.app_log_path.as_ref(),
+                    room_id.as_str(),
+                    "pipeline_disconnect",
+                  );
+                  invalid_reason = Some(reason);
+                  invalid_stream = true;
+                  break;
                 }
                 cache.update_from_tag(&tag);
                 let request_split = split_flag.swap(false, Ordering::SeqCst);
@@ -1170,7 +1188,7 @@ fn run_record_loop(
                       nickname.as_deref(),
                     )?;
                     cache.write_preamble(&mut new_segment)?;
-                    timestamp_fixer.reset();
+                    pipeline.reset_on_new_segment();
                     segment_start = Instant::now();
                     segment = Some(new_segment);
                     pending_split = false;
@@ -1184,6 +1202,9 @@ fn run_record_loop(
 
                 if let Some(seg) = segment.as_mut() {
                   seg.write(&tag.bytes)?;
+                  if decision.progressed {
+                    disconnect_retries = 0;
+                  }
                   if settings.cutting_mode == 1 {
                     let limit = settings.cutting_number.max(1) as u64;
                     if segment_start.elapsed().as_secs() >= limit {
@@ -1195,46 +1216,32 @@ fn run_record_loop(
                       split_flag.store(true, Ordering::SeqCst);
                     }
                   }
-                  let timestamp = parse_flv_timestamp(&tag);
-                  if let Some(prev) = last_tag_timestamp {
-                    if timestamp > prev {
-                      last_tag_timestamp = Some(timestamp);
-                      stagnant_count = 0;
-                      last_progress_at = Instant::now();
-                    } else {
-                      stagnant_count += 1;
-                    }
-                  } else {
-                    last_tag_timestamp = Some(timestamp);
-                    stagnant_count = 0;
-                    last_progress_at = Instant::now();
-                  }
-                  if stagnant_count >= INVALID_STREAM_TAG_LIMIT
-                    && last_progress_at.elapsed().as_secs() >= INVALID_STREAM_STALL_SECS
-                  {
-                    append_log(
-                      &context.app_log_path,
-                      &format!(
-                        "stream_invalid_flow room={} timestamp={} stagnant={}",
-                        room_id, timestamp, stagnant_count
-                      ),
-                    );
-                    mark_force_no_qn(
-                      &mut force_no_qn_until,
-                      &settings,
-                      context.app_log_path.as_ref(),
-                      room_id.as_str(),
-                      "invalid_flow",
-                    );
-                    invalid_stream = true;
-                    break;
-                  }
                 }
               }
             }
           }
           if invalid_stream {
+            disconnect_retries += 1;
+            if let Some(reason) = invalid_reason.as_deref() {
+              append_log(
+                &context.app_log_path,
+                &format!(
+                  "stream_disconnect_retry room={} retry={} reason={}",
+                  room_id, disconnect_retries, reason
+                ),
+              );
+            }
             stream_urls.clear();
+            if disconnect_retries >= 3 {
+              if let Some(mut seg) = segment.take() {
+                let record_id = seg.record_id;
+                let file_path = seg.file_path.clone();
+                seg.finish("FAILED", Some("流异常超过阈值，录制会话终止"))?;
+                drop(seg);
+                spawn_segment_remux(context.clone(), record_id, file_path);
+              }
+              return Err("流异常超过阈值".to_string());
+            }
             std::thread::sleep(Duration::from_millis(settings.stream_retry_ms.max(1000) as u64));
             break;
           }
@@ -1263,30 +1270,27 @@ fn run_record_loop(
           }
           let missing_since = missing_started_at.get_or_insert_with(Instant::now);
           let missing_elapsed = missing_since.elapsed().as_secs();
-          let should_split = settings.flv_fix_split_on_missing && !settings.flv_fix_disable_on_annexb;
-          let force_split = should_split || missing_elapsed >= MISSING_SEGMENT_WINDOW_SECS;
-          if force_split {
-            if let Some(mut seg) = segment.take() {
-              let record_id = seg.record_id;
-              let file_path = seg.file_path.clone();
-              seg.finish("COMPLETED", Some("读取异常自动分段"))?;
-              drop(seg);
-              spawn_segment_remux(context.clone(), record_id, file_path);
-            }
-            segment_index += 1;
-            pending_title = None;
-            pending_split = false;
-            missing_started_at = None;
-            current_title = load_current_title(&context, &room_id, &current_title);
-            current_file_path = build_record_path(
-              &settings.file_name_template,
-              &base_dir,
-              &room_info,
-              nickname.as_deref(),
-              &record_start_date,
-              segment_index,
+          if missing_elapsed >= MISSING_SEGMENT_WINDOW_SECS {
+            disconnect_retries += 1;
+            append_log(
+              &context.app_log_path,
+              &format!(
+                "stream_read_error_disconnect room={} elapsed={} retry={}",
+                room_id, missing_elapsed, disconnect_retries
+              ),
             );
-            update_current_file(&context, &room_id, &current_file_path);
+            stream_urls.clear();
+            if disconnect_retries >= 3 {
+              if let Some(mut seg) = segment.take() {
+                let record_id = seg.record_id;
+                let file_path = seg.file_path.clone();
+                seg.finish("FAILED", Some("读取异常超过阈值，录制会话终止"))?;
+                drop(seg);
+                spawn_segment_remux(context.clone(), record_id, file_path);
+              }
+              return Err("读取异常超过阈值".to_string());
+            }
+            std::thread::sleep(Duration::from_millis(settings.stream_retry_ms.max(1000) as u64));
             break;
           }
           append_log(
@@ -1579,6 +1583,187 @@ impl TimestampFixer {
   }
 }
 
+#[derive(Clone, Copy)]
+struct LivePipelineSettings {
+  split_on_script_tag: bool,
+  disable_split_on_h264_annexb: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PipelineAnnexBState {
+  Unknown,
+  Pending,
+  IsAnnexB,
+}
+
+#[derive(Default)]
+struct LivePipelineDecision {
+  request_split: Option<&'static str>,
+  disconnect_reason: Option<String>,
+  logs: Vec<String>,
+  progressed: bool,
+}
+
+struct LiveFlvPipeline {
+  settings: LivePipelineSettings,
+  timestamp_fixer: TimestampFixer,
+  metadata_received: bool,
+  annexb_state: PipelineAnnexBState,
+  last_audio_header: Option<Vec<u8>>,
+  last_video_header: Option<Vec<u8>>,
+  last_chunk_hash: Option<u64>,
+  duplicate_chunk_count: usize,
+  last_progress_timestamp: Option<u32>,
+  stagnant_count: usize,
+  last_progress_at: Instant,
+}
+
+impl LiveFlvPipeline {
+  fn new(
+    settings: LivePipelineSettings,
+    enable_timestamp_fix: bool,
+    apply_timestamp_fix: bool,
+  ) -> Self {
+    Self {
+      settings,
+      timestamp_fixer: TimestampFixer::new(enable_timestamp_fix, apply_timestamp_fix),
+      metadata_received: false,
+      annexb_state: PipelineAnnexBState::Unknown,
+      last_audio_header: None,
+      last_video_header: None,
+      last_chunk_hash: None,
+      duplicate_chunk_count: 0,
+      last_progress_timestamp: None,
+      stagnant_count: 0,
+      last_progress_at: Instant::now(),
+    }
+  }
+
+  fn reset_on_new_segment(&mut self) {
+    self.timestamp_fixer.reset();
+    self.last_progress_timestamp = None;
+    self.stagnant_count = 0;
+    self.last_progress_at = Instant::now();
+    self.last_chunk_hash = None;
+    self.duplicate_chunk_count = 0;
+  }
+
+  fn on_stream_header(&mut self) {
+    if self.settings.disable_split_on_h264_annexb {
+      self.annexb_state = PipelineAnnexBState::Unknown;
+    }
+  }
+
+  fn process_tag(&mut self, tag: &mut FlvTag) -> LivePipelineDecision {
+    let mut decision = LivePipelineDecision::default();
+
+    if self.settings.disable_split_on_h264_annexb && tag.tag_type == 9 && is_video_keyframe(tag) {
+      if contains_annexb_signature(tag.data()) {
+        self.annexb_state = match self.annexb_state {
+          PipelineAnnexBState::Unknown => {
+            decision.logs.push("pipeline_annexb_detected state=pending".to_string());
+            PipelineAnnexBState::Pending
+          }
+          PipelineAnnexBState::Pending | PipelineAnnexBState::IsAnnexB => {
+            decision.logs.push("pipeline_annexb_detected state=locked".to_string());
+            PipelineAnnexBState::IsAnnexB
+          }
+        };
+      }
+    }
+
+    let is_header_tag = tag.tag_type == 18 || is_audio_header_tag(tag.data()) || is_video_header_tag(tag.data());
+    if let Some(jump) = self.timestamp_fixer.fix_tag(tag, is_header_tag) {
+      decision.logs.push(format!(
+        "pipeline_timestamp_jump diff={} original={} fixed={} offset={}",
+        jump.diff, jump.original, jump.fixed, jump.offset
+      ));
+    }
+
+    if tag.tag_type == 18 {
+      if !self.metadata_received {
+        self.metadata_received = true;
+      } else if self.settings.split_on_script_tag {
+        decision.request_split.get_or_insert("script_tag");
+      }
+    }
+
+    if is_audio_header_tag(tag.data()) {
+      if self.process_header_change(true, tag) {
+        if self.settings.disable_split_on_h264_annexb && self.annexb_state == PipelineAnnexBState::IsAnnexB {
+          decision.logs.push("pipeline_header_changed skip_split=annexb".to_string());
+        } else {
+          decision.request_split.get_or_insert("audio_header_changed");
+        }
+      }
+    }
+
+    if is_video_header_tag(tag.data()) {
+      if self.process_header_change(false, tag) {
+        if self.settings.disable_split_on_h264_annexb && self.annexb_state == PipelineAnnexBState::IsAnnexB {
+          decision.logs.push("pipeline_header_changed skip_split=annexb".to_string());
+        } else {
+          decision.request_split.get_or_insert("video_header_changed");
+        }
+      }
+    }
+
+    let chunk_hash = calculate_tag_hash(&tag.bytes);
+    if self.last_chunk_hash == Some(chunk_hash) {
+      self.duplicate_chunk_count += 1;
+    } else {
+      self.last_chunk_hash = Some(chunk_hash);
+      self.duplicate_chunk_count = 0;
+    }
+    if self.duplicate_chunk_count >= INVALID_STREAM_TAG_LIMIT
+      && self.last_progress_at.elapsed().as_secs() >= INVALID_STREAM_STALL_SECS
+    {
+      decision
+        .disconnect_reason
+        .get_or_insert_with(|| "连续重复数据块，触发断流重连".to_string());
+    }
+
+    let timestamp = parse_flv_timestamp(tag);
+    if let Some(prev) = self.last_progress_timestamp {
+      if timestamp > prev {
+        self.last_progress_timestamp = Some(timestamp);
+        self.stagnant_count = 0;
+        self.last_progress_at = Instant::now();
+        decision.progressed = true;
+      } else {
+        self.stagnant_count += 1;
+      }
+    } else {
+      self.last_progress_timestamp = Some(timestamp);
+      self.stagnant_count = 0;
+      self.last_progress_at = Instant::now();
+      decision.progressed = true;
+    }
+
+    if self.stagnant_count >= INVALID_STREAM_TAG_LIMIT
+      && self.last_progress_at.elapsed().as_secs() >= INVALID_STREAM_STALL_SECS
+    {
+      decision
+        .disconnect_reason
+        .get_or_insert_with(|| format!("时间戳停滞，触发断流重连 timestamp={}", timestamp));
+    }
+
+    decision
+  }
+
+  fn process_header_change(&mut self, is_audio: bool, tag: &FlvTag) -> bool {
+    let normalized = normalize_header_tag(&tag.bytes);
+    let slot = if is_audio {
+      &mut self.last_audio_header
+    } else {
+      &mut self.last_video_header
+    };
+    let changed = slot.as_ref().map(|prev| prev != &normalized).unwrap_or(false);
+    *slot = Some(normalized);
+    changed
+  }
+}
+
 enum FlvParsedItem {
   Header(Vec<u8>),
   Tag(FlvTag),
@@ -1732,6 +1917,39 @@ fn parse_flv_timestamp(tag: &FlvTag) -> u32 {
   ts
 }
 
+fn calculate_tag_hash(data: &[u8]) -> u64 {
+  let mut hasher = DefaultHasher::new();
+  data.hash(&mut hasher);
+  hasher.finish()
+}
+
+fn contains_annexb_signature(data: &[u8]) -> bool {
+  if data.len() < 6 {
+    return false;
+  }
+  let payload = &data[2..];
+  let mut has_sps = false;
+  let mut has_pps = false;
+  let mut i = 0usize;
+  while i + 4 < payload.len() {
+    if payload[i] == 0 && payload[i + 1] == 0 && payload[i + 2] == 0 && payload[i + 3] == 1 {
+      let nalu_type = payload[i + 4] & 0x1f;
+      if nalu_type == 7 {
+        has_sps = true;
+      } else if nalu_type == 8 {
+        has_pps = true;
+      }
+      if has_sps && has_pps {
+        return true;
+      }
+      i += 4;
+      continue;
+    }
+    i += 1;
+  }
+  false
+}
+
 fn normalize_header_tag(tag: &[u8]) -> Vec<u8> {
   let mut normalized = tag.to_vec();
   if normalized.len() >= 11 {
@@ -1864,6 +2082,9 @@ fn spawn_segment_remux(context: LiveContext, record_id: i64, file_path: String) 
   let target_path = source_path.with_extension("mp4");
   let source = source_path.to_string_lossy().to_string();
   let target = target_path.to_string_lossy().to_string();
+  let source_size = std::fs::metadata(&source_path)
+    .map(|meta| meta.len())
+    .unwrap_or(0);
   let log_path = context.app_log_path.clone();
   let db = context.db.clone();
   tauri::async_runtime::spawn(async move {
@@ -1871,57 +2092,177 @@ fn spawn_segment_remux(context: LiveContext, record_id: i64, file_path: String) 
       log_path.as_ref(),
       &format!("live_remux_start record_id={} source={} target={}", record_id, source, target),
     );
-    let args = vec![
-      "-hide_banner".to_string(),
-      "-loglevel".to_string(),
-      "error".to_string(),
-      "-y".to_string(),
-      "-i".to_string(),
-      source.clone(),
-      "-c".to_string(),
-      "copy".to_string(),
-      "-shortest".to_string(),
-      target.clone(),
-    ];
-    let result = tauri::async_runtime::spawn_blocking(move || run_ffmpeg(&args))
+    let copy_args = build_live_remux_copy_args(&source, &target);
+    let copy_result = tauri::async_runtime::spawn_blocking(move || run_ffmpeg(&copy_args))
       .await
       .map_err(|_| "转封装执行失败".to_string());
-    match result {
-      Ok(Ok(())) => {
-        let file_size = std::fs::metadata(&target)
-          .map(|meta| meta.len())
-          .unwrap_or(0);
-        if let Err(err) = update_record_task_file_path(&db, record_id, &target, file_size) {
+
+    let mut final_target_size = 0u64;
+    let mut used_fallback_transcode = false;
+    let mut remux_ok = matches!(copy_result, Ok(Ok(())));
+    if remux_ok {
+      final_target_size = std::fs::metadata(&target).map(|meta| meta.len()).unwrap_or(0);
+      if is_suspicious_remux_output(source_size, final_target_size) {
+        append_log(
+          log_path.as_ref(),
+          &format!(
+            "live_remux_suspicious record_id={} source_size={} target_size={} action=fallback_transcode",
+            record_id, source_size, final_target_size
+          ),
+        );
+        used_fallback_transcode = true;
+        let fallback_args = build_live_remux_transcode_args(&source, &target);
+        let fallback_result = tauri::async_runtime::spawn_blocking(move || run_ffmpeg(&fallback_args))
+          .await
+          .map_err(|_| "兜底转码执行失败".to_string());
+        remux_ok = matches!(fallback_result, Ok(Ok(())));
+        if remux_ok {
+          final_target_size = std::fs::metadata(&target).map(|meta| meta.len()).unwrap_or(0);
+        } else if let Ok(Err(err)) = fallback_result {
           append_log(
             log_path.as_ref(),
-            &format!("live_remux_update_fail record_id={} err={}", record_id, err),
+            &format!("live_remux_fallback_fail record_id={} err={}", record_id, err),
           );
-        }
-        append_log(
-          log_path.as_ref(),
-          &format!("live_remux_done record_id={} status=ok", record_id),
-        );
-        if let Err(err) = baidu_sync::enqueue_live_sync(&db, log_path.as_ref(), record_id) {
+        } else if let Err(err) = fallback_result {
           append_log(
             log_path.as_ref(),
-            &format!("baidu_sync_enqueue_fail record_id={} err={}", record_id, err),
+            &format!("live_remux_fallback_fail record_id={} err={}", record_id, err),
           );
         }
       }
-      Ok(Err(err)) => {
+    } else if let Ok(Err(err)) = copy_result {
+      append_log(
+        log_path.as_ref(),
+        &format!("live_remux_copy_fail record_id={} err={}", record_id, err),
+      );
+      used_fallback_transcode = true;
+      let fallback_args = build_live_remux_transcode_args(&source, &target);
+      let fallback_result = tauri::async_runtime::spawn_blocking(move || run_ffmpeg(&fallback_args))
+        .await
+        .map_err(|_| "兜底转码执行失败".to_string());
+      remux_ok = matches!(fallback_result, Ok(Ok(())));
+      if remux_ok {
+        final_target_size = std::fs::metadata(&target).map(|meta| meta.len()).unwrap_or(0);
+      } else if let Ok(Err(fallback_err)) = fallback_result {
         append_log(
           log_path.as_ref(),
-          &format!("live_remux_done record_id={} status=err err={}", record_id, err),
+          &format!("live_remux_fallback_fail record_id={} err={}", record_id, fallback_err),
         );
-      }
-      Err(err) => {
+      } else if let Err(fallback_err) = fallback_result {
         append_log(
           log_path.as_ref(),
-          &format!("live_remux_done record_id={} status=err err={}", record_id, err),
+          &format!("live_remux_fallback_fail record_id={} err={}", record_id, fallback_err),
         );
       }
+    } else if let Err(err) = copy_result {
+      append_log(
+        log_path.as_ref(),
+        &format!("live_remux_copy_fail record_id={} err={}", record_id, err),
+      );
+    }
+
+    let final_suspicious = !remux_ok
+      || final_target_size < REMUX_MIN_VALID_OUTPUT_BYTES
+      || is_suspicious_remux_output(source_size, final_target_size);
+    if final_suspicious {
+      if let Err(err) = std::fs::remove_file(&target) {
+        append_log(
+          log_path.as_ref(),
+          &format!("live_remux_cleanup_fail record_id={} err={}", record_id, err),
+        );
+      }
+      append_log(
+        log_path.as_ref(),
+        &format!(
+          "live_remux_done record_id={} status=warn keep=flv fallback={}",
+          record_id, used_fallback_transcode
+        ),
+      );
+      if let Err(err) = baidu_sync::enqueue_live_sync(&db, log_path.as_ref(), record_id) {
+        append_log(
+          log_path.as_ref(),
+          &format!("baidu_sync_enqueue_fail record_id={} err={}", record_id, err),
+        );
+      }
+      return;
+    }
+
+    if let Err(err) = update_record_task_file_path(&db, record_id, &target, final_target_size) {
+      append_log(
+        log_path.as_ref(),
+        &format!("live_remux_update_fail record_id={} err={}", record_id, err),
+      );
+    }
+    append_log(
+      log_path.as_ref(),
+      &format!(
+        "live_remux_done record_id={} status=ok fallback={} size={}",
+        record_id, used_fallback_transcode, final_target_size
+      ),
+    );
+    if let Err(err) = baidu_sync::enqueue_live_sync(&db, log_path.as_ref(), record_id) {
+      append_log(
+        log_path.as_ref(),
+        &format!("baidu_sync_enqueue_fail record_id={} err={}", record_id, err),
+      );
     }
   });
+}
+
+fn build_live_remux_copy_args(source: &str, target: &str) -> Vec<String> {
+  vec![
+    "-hide_banner".to_string(),
+    "-loglevel".to_string(),
+    "error".to_string(),
+    "-y".to_string(),
+    "-fflags".to_string(),
+    "+genpts".to_string(),
+    "-i".to_string(),
+    source.to_string(),
+    "-map".to_string(),
+    "0".to_string(),
+    "-dn".to_string(),
+    "-c".to_string(),
+    "copy".to_string(),
+    target.to_string(),
+  ]
+}
+
+fn build_live_remux_transcode_args(source: &str, target: &str) -> Vec<String> {
+  vec![
+    "-hide_banner".to_string(),
+    "-loglevel".to_string(),
+    "error".to_string(),
+    "-y".to_string(),
+    "-fflags".to_string(),
+    "+genpts".to_string(),
+    "-i".to_string(),
+    source.to_string(),
+    "-map".to_string(),
+    "0:v:0".to_string(),
+    "-map".to_string(),
+    "0:a:0?".to_string(),
+    "-dn".to_string(),
+    "-c:v".to_string(),
+    "libx264".to_string(),
+    "-preset".to_string(),
+    "veryfast".to_string(),
+    "-crf".to_string(),
+    "18".to_string(),
+    "-pix_fmt".to_string(),
+    "yuv420p".to_string(),
+    "-c:a".to_string(),
+    "aac".to_string(),
+    "-b:a".to_string(),
+    "192k".to_string(),
+    target.to_string(),
+  ]
+}
+
+fn is_suspicious_remux_output(source_size: u64, target_size: u64) -> bool {
+  source_size >= REMUX_SUSPECT_SOURCE_MIN_BYTES
+    && (target_size as u128) * (REMUX_SUSPECT_RATIO_DEN as u128)
+      < (source_size as u128) * (REMUX_SUSPECT_RATIO_NUM as u128)
 }
 
 fn insert_record_task(

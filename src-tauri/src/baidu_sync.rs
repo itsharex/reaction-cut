@@ -76,6 +76,14 @@ pub struct BaiduRemoteDir {
   pub path: String,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BaiduRemoteEntry {
+  pub name: String,
+  pub path: String,
+  pub is_dir: bool,
+}
+
 #[derive(Clone)]
 pub struct BaiduSyncContext {
   pub db: Arc<Db>,
@@ -247,6 +255,23 @@ pub fn list_baidu_remote_dirs(
   db: &Db,
   path: &str,
 ) -> Result<Vec<BaiduRemoteDir>, String> {
+  let entries = list_baidu_remote_entries(db, path)?;
+  Ok(
+    entries
+      .into_iter()
+      .filter(|item| item.is_dir)
+      .map(|item| BaiduRemoteDir {
+        name: item.name,
+        path: item.path,
+      })
+      .collect(),
+  )
+}
+
+pub fn list_baidu_remote_entries(
+  db: &Db,
+  path: &str,
+) -> Result<Vec<BaiduRemoteEntry>, String> {
   let settings = load_baidu_sync_settings(db)?;
   let exec_path = resolve_baidu_exec_path(&settings.exec_path);
   let target_path = normalize_baidu_path(path);
@@ -256,7 +281,7 @@ pub fn list_baidu_remote_dirs(
   } else {
     output.stdout
   };
-  Ok(parse_baidu_ls_dirs(&content, &target_path))
+  Ok(parse_baidu_ls_entries(&content, &target_path))
 }
 
 pub fn check_baidu_remote_file_exists(db: &Db, remote_path: &str) -> Result<bool, String> {
@@ -1544,8 +1569,8 @@ fn load_room_baidu_sync_config(
   .map_err(|err| err.to_string())
 }
 
-fn parse_baidu_ls_dirs(output: &str, base_path: &str) -> Vec<BaiduRemoteDir> {
-  let mut dirs = Vec::new();
+fn parse_baidu_ls_entries(output: &str, base_path: &str) -> Vec<BaiduRemoteEntry> {
+  let mut entries = Vec::new();
   for line in output.lines() {
     let trimmed = strip_ansi(line).trim().to_string();
     let trimmed = trimmed.trim();
@@ -1558,7 +1583,7 @@ fn parse_baidu_ls_dirs(output: &str, base_path: &str) -> Vec<BaiduRemoteDir> {
     if trimmed.contains("文件总数") || trimmed.contains("目录总数") || trimmed.contains("总:") {
       continue;
     }
-    let name = if trimmed.contains('|') {
+    let (name, is_dir) = if trimmed.contains('|') {
       let columns: Vec<&str> = trimmed
         .split('|')
         .map(|value| value.trim())
@@ -1571,27 +1596,24 @@ fn parse_baidu_ls_dirs(output: &str, base_path: &str) -> Vec<BaiduRemoteDir> {
       if last.contains("文件(目录)") {
         continue;
       }
-      if !last.ends_with('/') {
-        continue;
-      }
-      last.trim_end_matches('/').trim().to_string()
+      let is_dir = last.ends_with('/');
+      (last.trim_end_matches('/').trim().to_string(), is_dir)
     } else {
-      if !trimmed.ends_with('/') {
-        continue;
-      }
       let last = extract_last_column(trimmed).unwrap_or(trimmed);
-      last.trim_end_matches('/').trim().to_string()
+      let is_dir = last.ends_with('/');
+      (last.trim_end_matches('/').trim().to_string(), is_dir)
     };
     if name.is_empty() {
       continue;
     }
     let path = join_baidu_path(base_path, &name);
-    dirs.push(BaiduRemoteDir {
+    entries.push(BaiduRemoteEntry {
       name,
       path,
+      is_dir,
     });
   }
-  dirs
+  entries
 }
 
 fn extract_last_column(line: &str) -> Option<&str> {

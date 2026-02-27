@@ -554,7 +554,7 @@ pub fn default_live_settings() -> LiveSettings {
     check_interval_sec: 180,
     flv_fix_split_on_missing: false,
     flv_fix_adjust_timestamp_jump: true,
-    flv_fix_split_on_timestamp_jump: true,
+    flv_fix_split_on_timestamp_jump: false,
     flv_fix_disable_on_annexb: false,
     baidu_sync_enabled: false,
     baidu_sync_path: "/录播".to_string(),

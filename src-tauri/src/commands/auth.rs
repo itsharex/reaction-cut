@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::time::Duration;
 
@@ -794,6 +795,9 @@ fn now_millis() -> u128 {
 
 fn append_auth_log(path: Option<&Path>, line: &str) {
   let Some(path) = path else { return; };
+  static AUTH_LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+  let lock = AUTH_LOG_LOCK.get_or_init(|| Mutex::new(()));
+  let _guard = lock.lock().ok();
   if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
     let _ = writeln!(file, "{}", line);
   }

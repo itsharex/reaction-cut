@@ -11,6 +11,7 @@ import { showErrorDialog } from "../lib/dialog";
 import { invokeCommand } from "../lib/tauri";
 import { formatDateTime } from "../lib/format";
 import BaiduSyncPathPicker from "../components/BaiduSyncPathPicker";
+import BaiduRemoteFilePicker from "../components/BaiduRemoteFilePicker";
 
 const statusFilters = [
   { value: "ALL", label: "全部" },
@@ -68,6 +69,7 @@ export default function SubmissionSection() {
   const [activityLoading, setActivityLoading] = useState(false);
   const [activityMessage, setActivityMessage] = useState("");
   const [tasks, setTasks] = useState([]);
+  const [currentUpProfile, setCurrentUpProfile] = useState({ uid: 0, name: "" });
   const [selectedTaskIds, setSelectedTaskIds] = useState(() => new Set());
   const [totalTasks, setTotalTasks] = useState(0);
   const [taskSearch, setTaskSearch] = useState("");
@@ -144,6 +146,10 @@ export default function SubmissionSection() {
   });
   const [syncPickerOpen, setSyncPickerOpen] = useState(false);
   const [syncTarget, setSyncTarget] = useState("");
+  const [remoteFilePickerOpen, setRemoteFilePickerOpen] = useState(false);
+  const [remoteFilePickerPath, setRemoteFilePickerPath] = useState("/");
+  const [bindingMergedVideo, setBindingMergedVideo] = useState(null);
+  const [bindingRemoteFile, setBindingRemoteFile] = useState(false);
   const [updateSubmitting, setUpdateSubmitting] = useState(false);
   const [retryingSegmentIds, setRetryingSegmentIds] = useState(() => new Set());
   const [editSegments, setEditSegments] = useState([]);
@@ -507,12 +513,12 @@ export default function SubmissionSection() {
       });
       if (!auth?.loggedIn) {
         setCollections([]);
+        setCurrentUpProfile({ uid: 0, name: "" });
         return;
       }
-      const userInfo = auth?.userInfo || {};
-      const level1 = userInfo?.data || userInfo;
-      const level2 = level1?.data || level1;
-      const mid = level2?.mid || level1?.mid || userInfo?.mid || 0;
+      const profile = extractCurrentAuthProfile(auth);
+      setCurrentUpProfile(profile);
+      const mid = profile.uid || 0;
       await invokeCommand("auth_client_log", {
         message: `collections_mid=${mid || 0}`,
       });
@@ -534,6 +540,50 @@ export default function SubmissionSection() {
       }
       setMessage(error.message);
     }
+  };
+
+  const extractCurrentAuthProfile = (auth) => {
+    if (!auth?.loggedIn) {
+      return { uid: 0, name: "" };
+    }
+    const userInfo = auth?.userInfo || {};
+    const level1 = userInfo?.data || userInfo;
+    const level2 = level1?.data || level1;
+    const uid = Number(
+      level2?.mid ||
+        level1?.mid ||
+        userInfo?.mid ||
+        level2?.user_id ||
+        level1?.user_id ||
+        userInfo?.user_id ||
+        0,
+    );
+    const name = String(
+      level2?.name ||
+        level1?.name ||
+        userInfo?.name ||
+        level2?.uname ||
+        level1?.uname ||
+        userInfo?.uname ||
+        level2?.username ||
+        level1?.username ||
+        userInfo?.username ||
+        level2?.nickname ||
+        level1?.nickname ||
+        userInfo?.nickname ||
+        "",
+    ).trim();
+    return {
+      uid: Number.isFinite(uid) ? uid : 0,
+      name,
+    };
+  };
+
+  const loadCurrentUpProfile = async () => {
+    try {
+      const auth = await invokeCommand("auth_status");
+      setCurrentUpProfile(extractCurrentAuthProfile(auth));
+    } catch (_) {}
   };
 
   const loadBaiduSyncSettings = async () => {
@@ -874,10 +924,67 @@ export default function SubmissionSection() {
     applySyncPath(syncTarget, path);
   };
 
+  const openRemoteFilePickerForMerged = (mergedVideo) => {
+    const taskId = selectedTask?.task?.taskId || "";
+    const mergedId = Number(mergedVideo?.id || 0);
+    if (!taskId || !mergedId) {
+      setMessage("合并视频信息不完整，无法绑定");
+      return;
+    }
+    const currentPath = resolveMergedRemotePath(mergedVideo);
+    let initialPath = selectedTask?.task?.baiduSyncPath || defaultBaiduSyncPath || "/";
+    if (currentPath && currentPath !== "-" && currentPath.includes("/")) {
+      const lastIndex = currentPath.lastIndexOf("/");
+      initialPath = lastIndex > 0 ? currentPath.slice(0, lastIndex) : "/";
+    }
+    setBindingMergedVideo({
+      taskId,
+      mergedId,
+      fileName: mergedVideo?.fileName || "",
+    });
+    setRemoteFilePickerPath(initialPath);
+    setRemoteFilePickerOpen(true);
+  };
+
+  const closeRemoteFilePicker = () => {
+    if (bindingRemoteFile) {
+      return;
+    }
+    setRemoteFilePickerOpen(false);
+    setBindingMergedVideo(null);
+  };
+
+  const handleConfirmRemoteFileBinding = async (remotePath) => {
+    if (!bindingMergedVideo?.taskId || !bindingMergedVideo?.mergedId) {
+      setMessage("绑定目标不存在，请重试");
+      return;
+    }
+    setBindingRemoteFile(true);
+    try {
+      await invokeCommand("submission_bind_merged_remote_file", {
+        request: {
+          taskId: bindingMergedVideo.taskId,
+          mergedId: bindingMergedVideo.mergedId,
+          remotePath,
+        },
+      });
+      const detail = await fetchTaskDetail(bindingMergedVideo.taskId, { log: false });
+      setSelectedTask(detail);
+      setMessage("网盘文件绑定成功");
+      setRemoteFilePickerOpen(false);
+      setBindingMergedVideo(null);
+    } catch (error) {
+      setMessage(error?.message || "绑定网盘文件失败");
+    } finally {
+      setBindingRemoteFile(false);
+    }
+  };
+
   useEffect(() => {
     loadPartitions();
     loadCollections();
     loadBaiduSyncSettings();
+    loadCurrentUpProfile();
   }, []);
 
   useEffect(() => {
@@ -1454,6 +1561,20 @@ export default function SubmissionSection() {
       await openUrl(`https://www.bilibili.com/video/${bvid}`);
     } catch (error) {
       setMessage(error?.message || "打开视频链接失败");
+    }
+  };
+
+  const handleOpenUpSpace = async () => {
+    const uid = Number(currentUpProfile?.uid || 0);
+    if (!uid) {
+      setMessage("当前账号UID无效，无法打开主页");
+      return;
+    }
+    try {
+      const { openUrl } = await import("@tauri-apps/plugin-opener");
+      await openUrl(`https://space.bilibili.com/${uid}`);
+    } catch (error) {
+      setMessage(error?.message || "打开UP主页失败");
     }
   };
 
@@ -2724,6 +2845,9 @@ export default function SubmissionSection() {
     return `${normalizedDir}/${remoteName}`;
   };
 
+  const currentUpName = String(currentUpProfile?.name || "").trim() || "-";
+  const currentUpUid = Number(currentUpProfile?.uid || 0);
+
   const resolveResegmentCount = (durationSeconds, segmentSecondsValue) => {
     const duration = Number(durationSeconds);
     const segmentSeconds = Math.floor(Number(segmentSecondsValue));
@@ -3644,6 +3768,7 @@ export default function SubmissionSection() {
                 <th className="px-6 py-3">任务状态</th>
                 <th className="px-6 py-3">工作流状态</th>
                 <th className="px-6 py-3">BVID</th>
+                <th className="px-6 py-3">UP主</th>
                 <th className="px-6 py-3">投稿状态</th>
                 <th className="px-6 py-3">拒绝原因</th>
                 <th className="px-6 py-3">创建时间</th>
@@ -3656,7 +3781,7 @@ export default function SubmissionSection() {
             <tbody className="whitespace-nowrap">
               {tasks.length === 0 ? (
                 <tr>
-                  <td className="px-6 py-4 text-[var(--muted)]" colSpan={10}>
+                  <td className="px-6 py-4 text-[var(--muted)]" colSpan={11}>
                     暂无任务。
                   </td>
                 </tr>
@@ -3736,6 +3861,18 @@ export default function SubmissionSection() {
                           onClick={() => handleOpenBvid(task.bvid)}
                         >
                           {task.bvid}
+                        </button>
+                      ) : (
+                        <span className="text-[var(--muted)]">-</span>
+                      )}
+                    </td>
+                    <td className="px-6 py-3 whitespace-nowrap">
+                      {currentUpUid > 0 ? (
+                        <button
+                          className="text-xs font-semibold text-[var(--accent)] underline underline-offset-2"
+                          onClick={handleOpenUpSpace}
+                        >
+                          {currentUpName}
                         </button>
                       ) : (
                         <span className="text-[var(--muted)]">-</span>
@@ -4745,32 +4882,50 @@ export default function SubmissionSection() {
                     <th className="px-4 py-2">网盘链接</th>
                     <th className="px-4 py-2">状态</th>
                     <th className="px-4 py-2">创建时间</th>
+                    <th className="px-4 py-2">操作</th>
                   </tr>
                 </thead>
                 <tbody>
                   {selectedTask.mergedVideos.length === 0 ? (
                     <tr>
-                      <td className="px-4 py-3 text-[var(--muted)]" colSpan={6}>
+                      <td className="px-4 py-3 text-[var(--muted)]" colSpan={7}>
                         暂无合并视频
                       </td>
                     </tr>
                   ) : (
-                    selectedTask.mergedVideos.map((item, index) => (
-                      <tr key={item.id} className="border-t border-black/5">
-                        <td className="px-4 py-2 text-[var(--muted)]">{index + 1}</td>
-                        <td className="px-4 py-2 text-[var(--ink)]">{item.fileName}</td>
-                        <td className="px-4 py-2 text-[var(--muted)]">{item.videoPath}</td>
-                        <td className="px-4 py-2 text-[var(--muted)] break-all">
-                          {resolveMergedRemotePath(item)}
-                        </td>
-                        <td className="px-4 py-2 text-[var(--muted)]">
-                          {formatMergedVideoStatus(item.status)}
-                        </td>
-                        <td className="px-4 py-2 text-[var(--muted)]">
-                          {formatDateTime(item.createTime)}
-                        </td>
-                      </tr>
-                    ))
+                    selectedTask.mergedVideos.map((item, index) => {
+                      const remotePath = resolveMergedRemotePath(item);
+                      const unbound = remotePath === "-";
+                      const bindingThisItem =
+                        bindingRemoteFile && Number(bindingMergedVideo?.mergedId || 0) === Number(item.id);
+                      return (
+                        <tr key={item.id} className="border-t border-black/5">
+                          <td className="px-4 py-2 text-[var(--muted)]">{index + 1}</td>
+                          <td className="px-4 py-2 text-[var(--ink)]">{item.fileName}</td>
+                          <td className="px-4 py-2 text-[var(--muted)]">{item.videoPath}</td>
+                          <td className="px-4 py-2 text-[var(--muted)] break-all">{remotePath}</td>
+                          <td className="px-4 py-2 text-[var(--muted)]">
+                            {formatMergedVideoStatus(item.status)}
+                          </td>
+                          <td className="px-4 py-2 text-[var(--muted)]">
+                            {formatDateTime(item.createTime)}
+                          </td>
+                          <td className="px-4 py-2">
+                            {unbound ? (
+                              <button
+                                className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-60"
+                                onClick={() => openRemoteFilePickerForMerged(item)}
+                                disabled={bindingRemoteFile}
+                              >
+                                {bindingThisItem ? "绑定中" : "绑定网盘文件"}
+                              </button>
+                            ) : (
+                              <span className="text-xs text-[var(--muted)]">已绑定</span>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })
                   )}
                 </tbody>
               </table>
@@ -5081,6 +5236,12 @@ export default function SubmissionSection() {
         onConfirm={handleConfirmSyncPicker}
         onClose={handleCloseSyncPicker}
         onChange={handleSyncPathChange}
+      />
+      <BaiduRemoteFilePicker
+        open={remoteFilePickerOpen}
+        initialPath={remoteFilePickerPath}
+        onClose={closeRemoteFilePicker}
+        onConfirm={handleConfirmRemoteFileBinding}
       />
     </div>
   );
