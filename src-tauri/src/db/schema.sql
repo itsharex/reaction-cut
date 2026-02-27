@@ -50,11 +50,15 @@ CREATE TABLE IF NOT EXISTS submission_task (
   reject_reason TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
+  bilibili_uid INTEGER,
+  baidu_uid TEXT,
   segment_prefix TEXT,
   baidu_sync_enabled INTEGER DEFAULT 0,
   baidu_sync_path TEXT,
   baidu_sync_filename TEXT
 );
+
+CREATE INDEX IF NOT EXISTS idx_submission_task_bilibili_uid ON submission_task (bilibili_uid);
 
 CREATE TABLE IF NOT EXISTS merged_video (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -63,6 +67,7 @@ CREATE TABLE IF NOT EXISTS merged_video (
   video_path TEXT,
   remote_dir TEXT,
   remote_name TEXT,
+  baidu_uid TEXT,
   duration INTEGER,
   status INTEGER DEFAULT 0,
   upload_progress REAL DEFAULT 0.0,
@@ -463,6 +468,7 @@ CREATE TABLE IF NOT EXISTS baidu_sync_task (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   source_type TEXT NOT NULL,
   source_id TEXT,
+  baidu_uid TEXT,
   source_title TEXT,
   local_path TEXT NOT NULL,
   remote_dir TEXT NOT NULL,

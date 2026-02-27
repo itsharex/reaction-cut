@@ -11,6 +11,10 @@ use tokio::time::{sleep, Duration};
 use crate::commands::settings::DEFAULT_BAIDU_MAX_PARALLEL;
 use crate::config::resolve_baidu_pcs_path;
 use crate::db::Db;
+use crate::path_store::{
+  load_local_path_prefix, to_absolute_local_path_opt_with_prefix, to_absolute_local_path_with_prefix,
+  to_stored_local_path,
+};
 use crate::utils::{append_log, apply_no_window, now_rfc3339, sanitize_filename};
 
 #[derive(Clone, Serialize)]
@@ -51,6 +55,7 @@ pub struct BaiduSyncTaskRecord {
   pub id: i64,
   pub source_type: String,
   pub source_id: Option<String>,
+  pub baidu_uid: Option<String>,
   pub source_title: Option<String>,
   pub local_path: String,
   pub remote_dir: String,
@@ -95,6 +100,7 @@ struct BaiduSyncTask {
   id: i64,
   source_type: String,
   source_id: Option<String>,
+  baidu_uid: Option<String>,
   local_path: String,
   remote_dir: String,
   remote_name: String,
@@ -207,15 +213,16 @@ pub fn list_baidu_sync_tasks(
   let status_filter = status.filter(|value| !value.trim().is_empty());
   let page_size = page_size.clamp(1, 200);
   let offset = (page - 1).max(0) * page_size;
+  let storage_prefix = load_local_path_prefix(db);
   db.with_conn(|conn| {
     let mut stmt = if status_filter.is_some() {
       conn.prepare(
-        "SELECT id, source_type, source_id, source_title, local_path, remote_dir, remote_name, status, progress, error, retry_count, policy, created_at, updated_at \
+        "SELECT id, source_type, source_id, baidu_uid, source_title, local_path, remote_dir, remote_name, status, progress, error, retry_count, policy, created_at, updated_at \
          FROM baidu_sync_task WHERE status = ?1 ORDER BY created_at DESC LIMIT ?2 OFFSET ?3",
       )?
     } else {
       conn.prepare(
-        "SELECT id, source_type, source_id, source_title, local_path, remote_dir, remote_name, status, progress, error, retry_count, policy, created_at, updated_at \
+        "SELECT id, source_type, source_id, baidu_uid, source_title, local_path, remote_dir, remote_name, status, progress, error, retry_count, policy, created_at, updated_at \
          FROM baidu_sync_task ORDER BY created_at DESC LIMIT ?1 OFFSET ?2",
       )?
     };
@@ -225,7 +232,12 @@ pub fn list_baidu_sync_tasks(
     } else {
       stmt.query_map((page_size, offset), map_baidu_sync_task)?
     };
-    let list = rows.collect::<Result<Vec<_>, _>>()?;
+    let mut list = rows.collect::<Result<Vec<_>, _>>()?;
+    for item in &mut list {
+      item.local_path =
+        to_absolute_local_path_opt_with_prefix(storage_prefix.as_path(), Some(item.local_path.clone()))
+          .unwrap_or_default();
+    }
     Ok(list)
   })
   .map_err(|err| err.to_string())
@@ -460,18 +472,19 @@ pub fn enqueue_submission_sync(
   );
   let task = db.with_conn(|conn| {
     conn.query_row(
-      "SELECT title, baidu_sync_enabled, baidu_sync_path, baidu_sync_filename FROM submission_task WHERE task_id = ?1",
+      "SELECT title, baidu_sync_enabled, baidu_sync_path, baidu_sync_filename, baidu_uid FROM submission_task WHERE task_id = ?1",
       [task_id],
       |row| {
         let title: String = row.get(0)?;
         let enabled: i64 = row.get(1)?;
         let path: Option<String> = row.get(2)?;
         let filename: Option<String> = row.get(3)?;
-        Ok((title, enabled != 0, path, filename))
+        let baidu_uid: Option<String> = row.get(4)?;
+        Ok((title, enabled != 0, path, filename, baidu_uid))
       },
     )
   });
-  let (title, task_enabled, task_path, task_filename) = match task {
+  let (title, task_enabled, task_path, task_filename, task_baidu_uid) = match task {
     Ok(value) => value,
     Err(err) => return Err(err.to_string()),
   };
@@ -517,8 +530,14 @@ pub fn enqueue_submission_sync(
     .filter(|name| !name.is_empty())
     .map(sanitize_filename)
     .unwrap_or_else(|| sanitize_filename(&local_name));
-  if let Err(err) =
-    bind_submission_merged_remote(db, task_id, &local_path, &remote_dir, &remote_name)
+  if let Err(err) = bind_submission_merged_remote(
+    db,
+    task_id,
+    &local_path,
+    &remote_dir,
+    &remote_name,
+    task_baidu_uid.as_deref(),
+  )
   {
     append_log(
       app_log_path,
@@ -547,6 +566,7 @@ pub fn enqueue_submission_sync(
     db,
     "submission_merged",
     Some(task_id.to_string()),
+    task_baidu_uid,
     Some(title),
     &local_path,
     &remote_dir,
@@ -624,10 +644,15 @@ pub fn enqueue_live_sync(
       record_id, file_path, remote_dir, remote_name
     ),
   );
+  let current_baidu_uid = load_baidu_login_info(db)?
+    .and_then(|info| info.uid)
+    .map(|value| value.trim().to_string())
+    .filter(|value| !value.is_empty());
   insert_baidu_sync_task(
     db,
     "live_segment",
     Some(record_id.to_string()),
+    current_baidu_uid,
     title,
     &file_path,
     &remote_dir,
@@ -1131,18 +1156,42 @@ async fn run_baidu_sync_task(
       task.id, task.local_path, task.remote_dir, task.remote_name, policy
     ),
   );
-  let upload_result = run_baidu_pcs_upload(
-    &exec_path,
-    &[
-      "upload".to_string(),
-      format!("-policy={}", policy),
-      task.local_path.clone(),
-      task.remote_dir.clone(),
-    ],
-    |progress| {
+  let upload_with_args = |args: &[String]| {
+    run_baidu_pcs_upload(&exec_path, args, |progress| {
       let _ = update_baidu_sync_progress(context.db.as_ref(), task.id, progress);
-    },
-  );
+    })
+  };
+  let primary_args = vec![
+    "upload".to_string(),
+    format!("-policy={}", policy),
+    "-p=4".to_string(),
+    "-l=1".to_string(),
+    task.local_path.clone(),
+    task.remote_dir.clone(),
+  ];
+  let upload_result = match upload_with_args(&primary_args) {
+    Ok(output) => Ok(output),
+    Err(err) if is_baidu_upload_parallel_limit_error(&err) => {
+      append_log(
+        context.app_log_path.as_ref(),
+        &format!(
+          "baidu_sync_task_retry_limited id={} err={} fallback=p1_l1_norapid",
+          task.id, err
+        ),
+      );
+      let fallback_args = vec![
+        "upload".to_string(),
+        format!("-policy={}", policy),
+        "-p=1".to_string(),
+        "-l=1".to_string(),
+        "--norapid".to_string(),
+        task.local_path.clone(),
+        task.remote_dir.clone(),
+      ];
+      upload_with_args(&fallback_args)
+    }
+    Err(err) => Err(err),
+  };
   match upload_result {
     Ok(output) => {
       let local_name = Path::new(&task.local_path)
@@ -1193,6 +1242,7 @@ async fn run_baidu_sync_task(
             &task.local_path,
             &task.remote_dir,
             &task.remote_name,
+            task.baidu_uid.as_deref(),
           ) {
             append_log(
               context.app_log_path.as_ref(),
@@ -1277,6 +1327,7 @@ fn insert_baidu_sync_task(
   db: &Db,
   source_type: &str,
   source_id: Option<String>,
+  baidu_uid: Option<String>,
   source_title: Option<String>,
   local_path: &str,
   remote_dir: &str,
@@ -1284,15 +1335,17 @@ fn insert_baidu_sync_task(
   policy: &str,
 ) -> Result<(), String> {
   let now = now_rfc3339();
+  let stored_local_path = to_stored_local_path(db, local_path);
   db.with_conn(|conn| {
     conn.execute(
-      "INSERT INTO baidu_sync_task (source_type, source_id, source_title, local_path, remote_dir, remote_name, status, progress, error, retry_count, policy, created_at, updated_at) \
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'PENDING', 0.0, NULL, 0, ?7, ?8, ?9)",
+      "INSERT INTO baidu_sync_task (source_type, source_id, baidu_uid, source_title, local_path, remote_dir, remote_name, status, progress, error, retry_count, policy, created_at, updated_at) \
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'PENDING', 0.0, NULL, 0, ?8, ?9, ?10)",
       (
         source_type,
         source_id.as_deref(),
+        baidu_uid.as_deref(),
         source_title.as_deref(),
-        local_path,
+        stored_local_path.as_str(),
         remote_dir,
         remote_name,
         policy,
@@ -1311,14 +1364,23 @@ fn bind_submission_merged_remote(
   local_path: &str,
   remote_dir: &str,
   remote_name: &str,
+  baidu_uid: Option<&str>,
 ) -> Result<(), String> {
   let now = now_rfc3339();
+  let stored_local_path = to_stored_local_path(db, local_path);
   let updated = db
     .with_conn(|conn| {
       conn.execute(
-        "UPDATE merged_video SET remote_dir = ?1, remote_name = ?2, update_time = ?3 \
-         WHERE task_id = ?4 AND video_path = ?5",
-        (remote_dir, remote_name, &now, task_id, local_path),
+        "UPDATE merged_video SET remote_dir = ?1, remote_name = ?2, baidu_uid = ?3, update_time = ?4 \
+         WHERE task_id = ?5 AND video_path = ?6",
+        (
+          remote_dir,
+          remote_name,
+          baidu_uid,
+          &now,
+          task_id,
+          stored_local_path.as_str(),
+        ),
       )
     })
     .map_err(|err| err.to_string())?;
@@ -1330,9 +1392,10 @@ fn bind_submission_merged_remote(
 
 fn load_next_pending_task(db: &Db) -> Result<Option<BaiduSyncTask>, String> {
   let now = now_rfc3339();
+  let storage_prefix = load_local_path_prefix(db);
   db.with_conn(|conn| {
     let mut stmt = conn.prepare(
-      "SELECT id, source_type, source_id, local_path, remote_dir, remote_name, retry_count, policy \
+      "SELECT id, source_type, source_id, baidu_uid, local_path, remote_dir, remote_name, retry_count, policy \
        FROM baidu_sync_task WHERE status = 'PENDING' ORDER BY created_at ASC LIMIT 1",
     )?;
     let mut rows = stmt.query([])?;
@@ -1346,11 +1409,17 @@ fn load_next_pending_task(db: &Db) -> Result<Option<BaiduSyncTask>, String> {
         id: task_id,
         source_type: row.get(1)?,
         source_id: row.get(2)?,
-        local_path: row.get(3)?,
-        remote_dir: row.get(4)?,
-        remote_name: row.get(5)?,
-        retry_count: row.get(6)?,
-        policy: row.get(7)?,
+        baidu_uid: row.get(3)?,
+        local_path: to_absolute_local_path_with_prefix(
+          storage_prefix.as_path(),
+          row.get::<_, String>(4)?.as_str(),
+        )
+        .to_string_lossy()
+        .to_string(),
+        remote_dir: row.get(5)?,
+        remote_name: row.get(6)?,
+        retry_count: row.get(7)?,
+        policy: row.get(8)?,
       };
       Ok(Some(task))
     } else {
@@ -1365,17 +1434,18 @@ fn map_baidu_sync_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<BaiduSyncTas
     id: row.get(0)?,
     source_type: row.get(1)?,
     source_id: row.get(2)?,
-    source_title: row.get(3)?,
-    local_path: row.get(4)?,
-    remote_dir: row.get(5)?,
-    remote_name: row.get(6)?,
-    status: row.get(7)?,
-    progress: row.get(8)?,
-    error: row.get(9)?,
-    retry_count: row.get(10)?,
-    policy: row.get(11)?,
-    created_at: row.get(12)?,
-    updated_at: row.get(13)?,
+    baidu_uid: row.get(3)?,
+    source_title: row.get(4)?,
+    local_path: row.get(5)?,
+    remote_dir: row.get(6)?,
+    remote_name: row.get(7)?,
+    status: row.get(8)?,
+    progress: row.get(9)?,
+    error: row.get(10)?,
+    retry_count: row.get(11)?,
+    policy: row.get(12)?,
+    created_at: row.get(13)?,
+    updated_at: row.get(14)?,
   })
 }
 
@@ -1760,6 +1830,12 @@ fn is_baidu_not_found_error(err: &str) -> bool {
     || lower.contains("no such file")
     || err.contains("未找到")
     || err.contains("不存在")
+}
+
+fn is_baidu_upload_parallel_limit_error(err: &str) -> bool {
+  err.contains("当前上传单个文件最大并发量")
+    || err.contains("最大同时上传文件数")
+    || err.contains("文件上传失败")
 }
 
 fn find_file_by_name(base_dir: &Path, file_name: &str) -> Option<PathBuf> {

@@ -22,6 +22,10 @@ use crate::config::{default_download_dir, resolve_aria2c_candidates};
 use crate::commands::settings::load_download_settings_from_db;
 use crate::ffmpeg::{run_ffmpeg, run_ffmpeg_with_progress, run_ffprobe_json};
 use crate::login_store::AuthInfo;
+use crate::path_store::{
+  load_local_path_prefix, to_absolute_local_path, to_absolute_local_path_opt_with_prefix,
+  to_absolute_local_path_with_prefix, to_stored_local_path, to_stored_local_path_with_prefix,
+};
 use crate::utils::{append_log, apply_no_window, build_output_path, now_rfc3339, sanitize_filename};
 use crate::bilibili::client::BilibiliClient;
 use crate::db::Db;
@@ -232,6 +236,15 @@ struct DownloadTaskCreateResult {
   actual_path: String,
 }
 
+fn resolve_runtime_local_path(db: &Db, value: &str) -> String {
+  let path = to_absolute_local_path(db, value);
+  if path.as_os_str().is_empty() {
+    String::new()
+  } else {
+    path.to_string_lossy().to_string()
+  }
+}
+
 #[tauri::command]
 pub async fn download_video(
   state: State<'_, AppState>,
@@ -271,6 +284,7 @@ pub async fn download_video(
 
 #[tauri::command]
 pub fn download_get(state: State<'_, AppState>, task_id: i64) -> ApiResponse<VideoDownloadRecord> {
+  let prefix = load_local_path_prefix(&state.db);
   match state.db.with_conn(|conn| {
     conn.query_row(
       "SELECT id, bvid, aid, title, part_title, part_count, current_part, download_url, local_path, resolution, codec, format, status, progress, progress_total, progress_done, create_time, update_time, source_type \
@@ -303,7 +317,11 @@ pub fn download_get(state: State<'_, AppState>, task_id: i64) -> ApiResponse<Vid
       },
     )
   }) {
-    Ok(record) => ApiResponse::success(record),
+    Ok(mut record) => {
+      record.local_path =
+        to_absolute_local_path_opt_with_prefix(prefix.as_path(), record.local_path);
+      ApiResponse::success(record)
+    }
     Err(err) => ApiResponse::error(format!("Failed to load download task: {}", err)),
   }
 }
@@ -313,6 +331,7 @@ pub fn download_list_by_status(
   state: State<'_, AppState>,
   status: i64,
 ) -> ApiResponse<Vec<VideoDownloadRecord>> {
+  let prefix = load_local_path_prefix(&state.db);
   match state.db.with_conn(|conn| {
     let mut stmt = conn.prepare(
       "SELECT id, bvid, aid, title, part_title, part_count, current_part, download_url, local_path, resolution, codec, format, status, progress, progress_total, progress_done, create_time, update_time, source_type \
@@ -347,7 +366,13 @@ pub fn download_list_by_status(
       .collect::<Result<Vec<_>, _>>()?;
     Ok(list)
   }) {
-    Ok(list) => ApiResponse::success(list),
+    Ok(mut list) => {
+      for item in &mut list {
+        item.local_path =
+          to_absolute_local_path_opt_with_prefix(prefix.as_path(), item.local_path.clone());
+      }
+      ApiResponse::success(list)
+    }
     Err(err) => ApiResponse::error(format!("Failed to load downloads: {}", err)),
   }
 }
@@ -394,7 +419,10 @@ pub fn download_delete(
       Some(value) if !value.trim().is_empty() => value,
       _ => return ApiResponse::error("缺少本地路径，无法删除文件".to_string()),
     };
-    let path = PathBuf::from(local_path);
+    let path = to_absolute_local_path(&state.db, &local_path);
+    if path.as_os_str().is_empty() {
+      return ApiResponse::error("缺少本地路径，无法删除文件".to_string());
+    }
     cleanup_download_outputs(&path);
     if path.exists() {
       let remove_result = if path.is_dir() {
@@ -493,9 +521,12 @@ pub async fn download_retry(
       return Ok(ApiResponse::error("任务已暂停，请使用继续下载"));
     }
     let local_path = match local_path {
-      Some(value) => value,
+      Some(value) => resolve_runtime_local_path(context.db.as_ref(), &value),
       None => return Ok(ApiResponse::error("缺少本地路径，无法重试")),
     };
+    if local_path.trim().is_empty() {
+      return Ok(ApiResponse::error("缺少本地路径，无法重试"));
+    }
     let remote_path = match download_url {
       Some(value) if !value.trim().is_empty() => value,
       _ => return Ok(ApiResponse::error("缺少远端路径，无法重试")),
@@ -530,9 +561,12 @@ pub async fn download_retry(
     None => return Ok(ApiResponse::error("该任务缺少CID，无法重试")),
   };
   let local_path = match local_path {
-    Some(value) => value,
+    Some(value) => resolve_runtime_local_path(context.db.as_ref(), &value),
     None => return Ok(ApiResponse::error("缺少本地路径，无法重试")),
   };
+  if local_path.trim().is_empty() {
+    return Ok(ApiResponse::error("缺少本地路径，无法重试"));
+  }
   let _ = reset_integrated_submission_status(&context, task_id);
 
   let part = DownloadPart {
@@ -668,9 +702,12 @@ pub async fn download_resume(
       return Ok(ApiResponse::error("任务未处于暂停状态"));
     }
     let local_path = match local_path {
-      Some(value) => value,
+      Some(value) => resolve_runtime_local_path(context.db.as_ref(), &value),
       None => return Ok(ApiResponse::error("缺少本地路径，无法继续下载")),
     };
+    if local_path.trim().is_empty() {
+      return Ok(ApiResponse::error("缺少本地路径，无法继续下载"));
+    }
     let remote_path = match download_url {
       Some(value) if !value.trim().is_empty() => value,
       _ => return Ok(ApiResponse::error("缺少远端路径，无法继续下载")),
@@ -703,9 +740,12 @@ pub async fn download_resume(
     None => return Ok(ApiResponse::error("该任务缺少CID，无法继续下载")),
   };
   let local_path = match local_path {
-    Some(value) => value,
+    Some(value) => resolve_runtime_local_path(context.db.as_ref(), &value),
     None => return Ok(ApiResponse::error("缺少本地路径，无法继续下载")),
   };
+  if local_path.trim().is_empty() {
+    return Ok(ApiResponse::error("缺少本地路径，无法继续下载"));
+  }
 
   let part = DownloadPart {
     cid,
@@ -814,9 +854,12 @@ async fn requeue_download_record(
     None => return Err("该任务缺少CID，无法重新下载".to_string()),
   };
   let local_path = match local_path {
-    Some(value) => value,
+    Some(value) => resolve_runtime_local_path(context.db.as_ref(), &value),
     None => return Err("缺少本地路径，无法重新下载".to_string()),
   };
+  if local_path.trim().is_empty() {
+    return Err("缺少本地路径，无法重新下载".to_string());
+  }
   let _ = reset_integrated_submission_status(context, record_id);
 
   let part = DownloadPart {
@@ -961,6 +1004,31 @@ async fn handle_integration_download(
     crate::commands::submission::normalize_baidu_sync_filename(
       submission.baidu_sync_filename.as_deref(),
     );
+  let bilibili_uid = match context
+    .login_store
+    .load_auth_info(context.db.as_ref())
+    .ok()
+    .flatten()
+    .and_then(|info| info.user_id)
+  {
+    Some(value) => value,
+    None => return ApiResponse::error("请先登录B站账号".to_string()),
+  };
+  let task_baidu_uid = if submission.baidu_sync_enabled.unwrap_or(false) {
+    match baidu_sync::load_baidu_login_info(context.db.as_ref())
+      .ok()
+      .flatten()
+      .filter(|info| info.status == "LOGGED_IN")
+      .and_then(|info| info.uid)
+      .map(|value| value.trim().to_string())
+      .filter(|value| !value.is_empty())
+    {
+      Some(value) => Some(value),
+      None => return ApiResponse::error("请先登录网盘账号".to_string()),
+    }
+  } else {
+    None
+  };
   if !download_results.is_empty() {
     let mut path_by_cid: HashMap<i64, String> = HashMap::new();
     let mut path_by_expected: HashMap<String, String> = HashMap::new();
@@ -985,8 +1053,8 @@ async fn handle_integration_download(
 
   let insert_result = context.db.with_conn(|conn| {
     conn.execute(
-      "INSERT INTO submission_task (task_id, status, priority, title, description, cover_url, partition_id, tags, topic_id, mission_id, activity_title, video_type, collection_id, bvid, aid, created_at, updated_at, segment_prefix, baidu_sync_enabled, baidu_sync_path, baidu_sync_filename) \
-       VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, NULL, ?13, ?14, ?15, ?16, ?17, ?18)",
+      "INSERT INTO submission_task (task_id, status, priority, title, description, cover_url, partition_id, tags, topic_id, mission_id, activity_title, video_type, collection_id, bvid, aid, created_at, updated_at, bilibili_uid, baidu_uid, segment_prefix, baidu_sync_enabled, baidu_sync_path, baidu_sync_filename) \
+       VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, NULL, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
       params![
         &submission_id,
         "PENDING",
@@ -1002,6 +1070,8 @@ async fn handle_integration_download(
         submission.collection_id,
         &now,
         &now,
+        bilibili_uid,
+        task_baidu_uid.as_deref(),
         submission.segment_prefix,
         if submission.baidu_sync_enabled.unwrap_or(false) {
           1
@@ -1015,13 +1085,14 @@ async fn handle_integration_download(
 
     for (index, part) in submission.video_parts.into_iter().enumerate() {
       let part_id = uuid::Uuid::new_v4().to_string();
+      let stored_file_path = to_stored_local_path(context.db.as_ref(), &part.file_path);
       conn.execute(
         "INSERT INTO task_source_video (id, task_id, source_file_path, sort_order, start_time, end_time) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         (
           part_id,
           &submission_id,
-          part.file_path,
+          stored_file_path,
           (index + 1) as i64,
           part.start_time,
           part.end_time,
@@ -1118,6 +1189,7 @@ async fn create_download_tasks(
   let part_count = parts.len() as i64;
   let settings = load_download_settings_from_db(&context.db)
     .map_err(|err| format!("Failed to load download settings: {}", err))?;
+  let storage_prefix = load_local_path_prefix(&context.db);
   let base_dir = request
     .config
     .download_path
@@ -1156,6 +1228,8 @@ async fn create_download_tasks(
 
     let output_path = resolve_unique_output_path(&context, output_path)?;
     let actual_path = output_path.to_string_lossy().to_string();
+    let stored_actual_path =
+      to_stored_local_path_with_prefix(storage_prefix.as_path(), actual_path.as_str());
 
     let record_id = context
       .db
@@ -1171,7 +1245,7 @@ async fn create_download_tasks(
             part_count,
             (index + 1) as i64,
             request.video_url.as_str(),
-            actual_path.as_str(),
+            stored_actual_path.as_str(),
             &now,
             &now,
             request.config.resolution.as_deref(),
@@ -1208,6 +1282,7 @@ fn find_reusable_download_record(
   download_url: &str,
   part_title: &str,
 ) -> Result<Option<(i64, String, i64)>, String> {
+  let storage_prefix = load_local_path_prefix(context.db.as_ref());
   context
     .db
     .with_conn(|conn| {
@@ -1235,8 +1310,13 @@ fn find_reusable_download_record(
       }
 
       for (id, local_path, status) in candidates {
-        if Path::new(&local_path).is_file() {
-          return Ok(Some((id, local_path, status)));
+        let runtime_path = to_absolute_local_path_with_prefix(storage_prefix.as_path(), &local_path);
+        if runtime_path.is_file() {
+          return Ok(Some((
+            id,
+            runtime_path.to_string_lossy().to_string(),
+            status,
+          )));
         }
       }
       Ok(None)
@@ -1276,7 +1356,10 @@ fn download_path_conflict(
   context: &DownloadContext,
   output_path: &Path,
 ) -> Result<bool, String> {
-  let path_value = output_path.to_string_lossy().to_string();
+  let path_value = to_stored_local_path(
+    context.db.as_ref(),
+    output_path.to_string_lossy().as_ref(),
+  );
   let exists_in_db = context
     .db
     .with_conn(|conn| {
@@ -1355,6 +1438,7 @@ fn load_pending_downloads(
   if limit <= 0 {
     return Ok(Vec::new());
   }
+  let storage_prefix = load_local_path_prefix(context.db.as_ref());
   context
     .db
     .with_conn(|conn| {
@@ -1381,7 +1465,14 @@ fn load_pending_downloads(
             .unwrap_or_else(|| DOWNLOAD_SOURCE_BILIBILI.to_string()),
         })
       })?;
-      Ok(rows.collect::<Result<Vec<_>, _>>()?)
+      let mut list = rows.collect::<Result<Vec<_>, _>>()?;
+      for item in &mut list {
+        item.local_path = to_absolute_local_path_opt_with_prefix(
+          storage_prefix.as_path(),
+          item.local_path.clone(),
+        );
+      }
+      Ok(list)
     })
     .map_err(|err| format!("Failed to load pending downloads: {}", err))
 }

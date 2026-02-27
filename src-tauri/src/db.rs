@@ -62,6 +62,8 @@ impl Db {
     let _ = conn.execute("ALTER TABLE submission_task ADD COLUMN aid INTEGER", []);
     let _ = conn.execute("ALTER TABLE submission_task ADD COLUMN remote_state INTEGER", []);
     let _ = conn.execute("ALTER TABLE submission_task ADD COLUMN reject_reason TEXT", []);
+    let _ = conn.execute("ALTER TABLE submission_task ADD COLUMN bilibili_uid INTEGER", []);
+    let _ = conn.execute("ALTER TABLE submission_task ADD COLUMN baidu_uid TEXT", []);
     let _ = conn.execute("ALTER TABLE submission_task ADD COLUMN priority INTEGER DEFAULT 0", []);
     let _ = conn.execute(
       "ALTER TABLE submission_task ADD COLUMN baidu_sync_enabled INTEGER DEFAULT 0",
@@ -100,6 +102,7 @@ impl Db {
     let _ = conn.execute("ALTER TABLE merged_video ADD COLUMN upload_last_part_index INTEGER DEFAULT 0", []);
     let _ = conn.execute("ALTER TABLE merged_video ADD COLUMN remote_dir TEXT", []);
     let _ = conn.execute("ALTER TABLE merged_video ADD COLUMN remote_name TEXT", []);
+    let _ = conn.execute("ALTER TABLE merged_video ADD COLUMN baidu_uid TEXT", []);
     let _ = conn.execute("ALTER TABLE task_output_segment ADD COLUMN upload_progress REAL DEFAULT 0.0", []);
     let _ = conn.execute("ALTER TABLE task_output_segment ADD COLUMN upload_uploaded_bytes INTEGER DEFAULT 0", []);
     let _ = conn.execute("ALTER TABLE task_output_segment ADD COLUMN upload_total_bytes INTEGER DEFAULT 0", []);
@@ -115,6 +118,7 @@ impl Db {
       "ALTER TABLE live_room_settings ADD COLUMN baidu_sync_enabled INTEGER DEFAULT 0",
       [],
     );
+    let _ = conn.execute("ALTER TABLE baidu_sync_task ADD COLUMN baidu_uid TEXT", []);
 
     Ok(Self {
       conn: Mutex::new(conn),

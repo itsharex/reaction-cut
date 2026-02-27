@@ -17,6 +17,7 @@ mod ffmpeg;
 mod live_recorder;
 mod login_refresh;
 mod login_store;
+mod path_store;
 mod processing;
 mod utils;
 
@@ -241,7 +242,10 @@ pub fn run() {
             commands::submission::submission_resegment,
             commands::submission::submission_list,
             commands::submission::submission_list_by_status,
+            commands::submission::submission_export,
+            commands::submission::submission_import,
             commands::submission::submission_task_dir,
+            commands::submission::submission_open_task_dir,
             commands::submission::submission_delete_preview,
             commands::submission::submission_detail,
             commands::submission::submission_edit_prepare,

@@ -4,6 +4,7 @@ import {
   confirm as dialogConfirm,
   message as dialogMessage,
   open as openDialog,
+  save as saveDialog,
 } from "@tauri-apps/plugin-dialog";
 import LoadingButton from "../components/LoadingButton";
 import { showErrorDialog } from "../lib/dialog";
@@ -67,6 +68,7 @@ export default function SubmissionSection() {
   const [activityLoading, setActivityLoading] = useState(false);
   const [activityMessage, setActivityMessage] = useState("");
   const [tasks, setTasks] = useState([]);
+  const [selectedTaskIds, setSelectedTaskIds] = useState(() => new Set());
   const [totalTasks, setTotalTasks] = useState(0);
   const [taskSearch, setTaskSearch] = useState("");
   const [selectedTask, setSelectedTask] = useState(null);
@@ -117,6 +119,8 @@ export default function SubmissionSection() {
   const [repostUseCurrentBvid, setRepostUseCurrentBvid] = useState(false);
   const [repostSubmitting, setRepostSubmitting] = useState(false);
   const [createSubmitting, setCreateSubmitting] = useState(false);
+  const [exportingTasks, setExportingTasks] = useState(false);
+  const [importingTasks, setImportingTasks] = useState(false);
 
   const [repostMode, setRepostMode] = useState("SPECIFIED");
   const [repostMergedVideos, setRepostMergedVideos] = useState([]);
@@ -682,6 +686,115 @@ export default function SubmissionSection() {
     }
   };
 
+  const toggleTaskSelection = (taskId, checked) => {
+    const normalized = String(taskId || "").trim();
+    if (!normalized) {
+      return;
+    }
+    setSelectedTaskIds((prev) => {
+      const next = new Set(prev);
+      if (checked) {
+        next.add(normalized);
+      } else {
+        next.delete(normalized);
+      }
+      return next;
+    });
+  };
+
+  const toggleCurrentPageSelection = (checked) => {
+    setSelectedTaskIds((prev) => {
+      const next = new Set(prev);
+      tasks.forEach((task) => {
+        const taskId = String(task?.taskId || "").trim();
+        if (!taskId) {
+          return;
+        }
+        if (checked) {
+          next.add(taskId);
+        } else {
+          next.delete(taskId);
+        }
+      });
+      return next;
+    });
+  };
+
+  const handleExportTasks = async (exportAll = false) => {
+    if (!exportAll && selectedTaskIds.size === 0) {
+      setMessage("请先勾选要导出的投稿任务");
+      return;
+    }
+    const now = new Date();
+    const stamp = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(
+      now.getDate(),
+    ).padStart(2, "0")}_${String(now.getHours()).padStart(2, "0")}${String(
+      now.getMinutes(),
+    ).padStart(2, "0")}${String(now.getSeconds()).padStart(2, "0")}`;
+    const selected = await saveDialog({
+      title: exportAll ? "导出全部投稿任务" : "导出选中投稿任务",
+      defaultPath: `submission_export_${stamp}.json`,
+      filters: [{ name: "JSON", extensions: ["json"] }],
+    });
+    if (typeof selected !== "string" || !selected.trim()) {
+      return;
+    }
+    setExportingTasks(true);
+    try {
+      const result = await invokeCommand("submission_export", {
+        request: {
+          exportAll: exportAll,
+          taskIds: exportAll ? [] : Array.from(selectedTaskIds),
+          savePath: selected,
+        },
+      });
+      await dialogMessage(
+        `导出完成，共 ${result?.taskCount ?? 0} 条任务\n文件：${result?.filePath || selected}`,
+        {
+          title: "导出成功",
+          kind: "info",
+        },
+      );
+      setMessage(`导出成功：${result?.filePath || selected}`);
+    } catch (error) {
+      setMessage(error.message);
+    } finally {
+      setExportingTasks(false);
+    }
+  };
+
+  const handleImportTasks = async () => {
+    const selected = await openDialog({
+      title: "选择投稿任务导入文件",
+      multiple: false,
+      directory: false,
+      filters: [{ name: "JSON", extensions: ["json"] }],
+    });
+    if (typeof selected !== "string" || !selected.trim()) {
+      return;
+    }
+    setImportingTasks(true);
+    try {
+      const result = await invokeCommand("submission_import", {
+        request: {
+          filePath: selected,
+        },
+      });
+      await loadTasks(statusFilter, currentPage, pageSize, false, taskSearch, "import");
+      const summary = `总数 ${result?.totalTasks ?? 0}，导入 ${result?.importedTasks ?? 0}，跳过 ${result?.skippedTasks ?? 0}，失败 ${result?.failedTasks ?? 0}`;
+      await dialogMessage(summary, {
+        title: "导入完成",
+        kind: "info",
+      });
+      setMessage(summary);
+      setSelectedTaskIds(new Set());
+    } catch (error) {
+      setMessage(error.message);
+    } finally {
+      setImportingTasks(false);
+    }
+  };
+
   const loadQuickFillTasks = async (page = quickFillPage, keyword = quickFillSearch) => {
     try {
       try {
@@ -801,7 +914,14 @@ export default function SubmissionSection() {
     }
     loadTasks(statusFilter, currentPage, pageSize);
     return undefined;
-  }, [submissionView, statusFilter, currentPage, pageSize, taskSearch]);
+    }, [submissionView, statusFilter, currentPage, pageSize, taskSearch]);
+
+  useEffect(() => {
+    if (submissionView !== "list") {
+      return;
+    }
+    setSelectedTaskIds(new Set());
+  }, [submissionView, statusFilter, taskSearch]);
 
   useEffect(() => {
     if (submissionView !== "list") {
@@ -1109,6 +1229,24 @@ export default function SubmissionSection() {
       setMessage("时间范围不合法，请检查开始与结束时间");
       return;
     }
+    try {
+      const auth = await invokeCommand("auth_status");
+      if (!auth?.loggedIn) {
+        setMessage("请先登录B站账号");
+        return;
+      }
+      if (taskForm.baiduSyncEnabled) {
+        const baiduStatus = await invokeCommand("baidu_sync_status");
+        const baiduUid = String(baiduStatus?.uid || "").trim();
+        if (baiduStatus?.status !== "LOGGED_IN" || !baiduUid) {
+          setMessage("请先登录网盘账号");
+          return;
+        }
+      }
+    } catch (error) {
+      setMessage(error.message || "登录状态校验失败");
+      return;
+    }
     setCreateSubmitting(true);
     try {
       const payload = {
@@ -1325,11 +1463,15 @@ export default function SubmissionSection() {
       return;
     }
     try {
-      const folderPath = await invokeCommand("submission_task_dir", { taskId });
-      const { openPath } = await import("@tauri-apps/plugin-opener");
-      await openPath(folderPath);
+      await invokeCommand("submission_open_task_dir", { taskId });
     } catch (error) {
-      setMessage(error?.message || "打开任务目录失败");
+      try {
+        const folderPath = await invokeCommand("submission_task_dir", { taskId });
+        const { openPath } = await import("@tauri-apps/plugin-opener");
+        await openPath(folderPath);
+      } catch (fallbackError) {
+        setMessage(fallbackError?.message || error?.message || "打开任务目录失败");
+      }
     }
   };
 
@@ -2569,6 +2711,19 @@ export default function SubmissionSection() {
     return `${displayName}${createdAt}`.trim();
   };
 
+  const resolveMergedRemotePath = (merged) => {
+    if (!merged) {
+      return "-";
+    }
+    const remoteDir = String(merged.remoteDir || "").trim();
+    const remoteName = String(merged.remoteName || "").trim();
+    if (!remoteDir || !remoteName) {
+      return "-";
+    }
+    const normalizedDir = remoteDir.endsWith("/") ? remoteDir.slice(0, -1) : remoteDir;
+    return `${normalizedDir}/${remoteName}`;
+  };
+
   const resolveResegmentCount = (durationSeconds, segmentSecondsValue) => {
     const duration = Number(durationSeconds);
     const segmentSeconds = Math.floor(Number(segmentSecondsValue));
@@ -2628,6 +2783,13 @@ export default function SubmissionSection() {
   const totalPages = Math.max(1, Math.ceil(totalTasks / pageSize));
   const quickFillTotalPages = Math.max(1, Math.ceil(quickFillTotal / quickFillPageSize));
   const quickFillVisibleTasks = quickFillTasks.slice(0, quickFillPageSize);
+  const currentPageTaskIds = tasks
+    .map((task) => String(task?.taskId || "").trim())
+    .filter((taskId) => taskId);
+  const allCurrentPageSelected =
+    currentPageTaskIds.length > 0 &&
+    currentPageTaskIds.every((taskId) => selectedTaskIds.has(taskId));
+  const selectedTaskCount = selectedTaskIds.size;
 
   return (
     <div className="space-y-6">
@@ -3424,6 +3586,27 @@ export default function SubmissionSection() {
             </button>
             <button
               className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)] transition hover:border-black/20 disabled:cursor-not-allowed disabled:opacity-60"
+              onClick={() => handleExportTasks(false)}
+              disabled={exportingTasks || importingTasks || selectedTaskCount === 0}
+            >
+              {exportingTasks ? "导出中" : `导出选中(${selectedTaskCount})`}
+            </button>
+            <button
+              className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)] transition hover:border-black/20 disabled:cursor-not-allowed disabled:opacity-60"
+              onClick={() => handleExportTasks(true)}
+              disabled={exportingTasks || importingTasks}
+            >
+              导出全部
+            </button>
+            <button
+              className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)] transition hover:border-black/20 disabled:cursor-not-allowed disabled:opacity-60"
+              onClick={handleImportTasks}
+              disabled={importingTasks || exportingTasks}
+            >
+              {importingTasks ? "导入中" : "导入"}
+            </button>
+            <button
+              className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)] transition hover:border-black/20 disabled:cursor-not-allowed disabled:opacity-60"
               onClick={handleWorkflowRefresh}
               disabled={refreshingRemote}
             >
@@ -3449,6 +3632,14 @@ export default function SubmissionSection() {
           <table className="w-full min-w-max table-auto text-left text-sm whitespace-nowrap">
             <thead className="bg-black/5 text-xs uppercase tracking-[0.2em] text-[var(--muted)] whitespace-nowrap">
               <tr>
+                <th className="px-3 py-3">
+                  <input
+                    type="checkbox"
+                    checked={allCurrentPageSelected}
+                    onChange={(event) => toggleCurrentPageSelection(event.target.checked)}
+                    aria-label="全选当前页"
+                  />
+                </th>
                 <th className="px-6 py-3">标题</th>
                 <th className="px-6 py-3">任务状态</th>
                 <th className="px-6 py-3">工作流状态</th>
@@ -3465,13 +3656,23 @@ export default function SubmissionSection() {
             <tbody className="whitespace-nowrap">
               {tasks.length === 0 ? (
                 <tr>
-                  <td className="px-6 py-4 text-[var(--muted)]" colSpan={9}>
+                  <td className="px-6 py-4 text-[var(--muted)]" colSpan={10}>
                     暂无任务。
                   </td>
                 </tr>
               ) : (
                 tasks.map((task) => (
                   <tr key={task.taskId} className="border-t border-black/5">
+                    <td className="px-3 py-3">
+                      <input
+                        type="checkbox"
+                        checked={selectedTaskIds.has(String(task.taskId || "").trim())}
+                        onChange={(event) =>
+                          toggleTaskSelection(task.taskId, event.target.checked)
+                        }
+                        aria-label={`选择任务 ${task.title || task.taskId || ""}`}
+                      />
+                    </td>
                     <td className="px-6 py-3 text-[var(--ink)] whitespace-normal">
                       <button
                         className="text-left font-semibold text-[var(--ink)] transition hover:text-[var(--accent)] hover:underline hover:underline-offset-4 break-words"
@@ -3668,7 +3869,7 @@ export default function SubmissionSection() {
         </div>
         <div className="flex flex-wrap items-center justify-between gap-3 border-t border-black/5 px-6 py-4 text-sm text-[var(--muted)]">
           <div>
-            共 {totalTasks} 条，当前第 {currentPage}/{totalPages} 页
+            共 {totalTasks} 条，当前第 {currentPage}/{totalPages} 页，已选择 {selectedTaskCount} 条
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <select
@@ -4541,6 +4742,7 @@ export default function SubmissionSection() {
                     <th className="px-4 py-2">序号</th>
                     <th className="px-4 py-2">文件名</th>
                     <th className="px-4 py-2">文件路径</th>
+                    <th className="px-4 py-2">网盘链接</th>
                     <th className="px-4 py-2">状态</th>
                     <th className="px-4 py-2">创建时间</th>
                   </tr>
@@ -4548,7 +4750,7 @@ export default function SubmissionSection() {
                 <tbody>
                   {selectedTask.mergedVideos.length === 0 ? (
                     <tr>
-                      <td className="px-4 py-3 text-[var(--muted)]" colSpan={5}>
+                      <td className="px-4 py-3 text-[var(--muted)]" colSpan={6}>
                         暂无合并视频
                       </td>
                     </tr>
@@ -4558,6 +4760,9 @@ export default function SubmissionSection() {
                         <td className="px-4 py-2 text-[var(--muted)]">{index + 1}</td>
                         <td className="px-4 py-2 text-[var(--ink)]">{item.fileName}</td>
                         <td className="px-4 py-2 text-[var(--muted)]">{item.videoPath}</td>
+                        <td className="px-4 py-2 text-[var(--muted)] break-all">
+                          {resolveMergedRemotePath(item)}
+                        </td>
                         <td className="px-4 py-2 text-[var(--muted)]">
                           {formatMergedVideoStatus(item.status)}
                         </td>
