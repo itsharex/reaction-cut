@@ -42,6 +42,8 @@ use crate::processing::{
   segment_file, ClipSource,
 };
 use crate::utils::{append_log, now_rfc3339, sanitize_filename};
+#[cfg(target_os = "windows")]
+use crate::utils::apply_no_window;
 use crate::AppState;
 
 #[derive(Clone)]
