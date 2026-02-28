@@ -748,8 +748,20 @@ pub async fn submission_create(
       to_stored_local_path_with_prefix(context.local_path_prefix.as_path(), &source.source_file_path)
     })
     .collect::<Vec<_>>();
+  append_log(
+    &state.app_log_path,
+    &format!(
+      "submission_create_prepared task_id={} sources={}",
+      task_id,
+      stored_source_paths.len()
+    ),
+  );
 
   let result = context.db.with_conn(|conn| {
+    append_log(
+      &state.app_log_path,
+      &format!("submission_create_db_lock_acquired task_id={}", task_id),
+    );
     let normalized_baidu_sync_filename =
       normalize_baidu_sync_filename(request.task.baidu_sync_filename.as_deref());
     conn.execute(
@@ -782,6 +794,10 @@ pub async fn submission_create(
         normalized_baidu_sync_filename.as_deref(),
       ],
     )?;
+    append_log(
+      &state.app_log_path,
+      &format!("submission_create_task_inserted task_id={}", task_id),
+    );
 
     for (source, stored_source_path) in request.source_videos.iter().zip(stored_source_paths.iter()) {
       let source_id = uuid::Uuid::new_v4().to_string();
@@ -798,6 +814,14 @@ pub async fn submission_create(
         ),
       )?;
     }
+    append_log(
+      &state.app_log_path,
+      &format!(
+        "submission_create_sources_inserted task_id={} count={}",
+        task_id,
+        request.source_videos.len()
+      ),
+    );
 
     Ok(())
   });
