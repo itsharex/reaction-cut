@@ -37,7 +37,7 @@ use crate::login_refresh;
 use crate::login_store::{AuthInfo, LoginStore};
 use crate::path_store::{
   load_local_path_prefix, to_absolute_local_path_opt_with_prefix, to_absolute_local_path_with_prefix,
-  to_stored_local_path_with_prefix,
+  to_portable_relative_path_with_prefix, to_stored_local_path_with_prefix,
 };
 use crate::processing::{
   clip_sources, decide_clip_copy, merge_files, parse_time_to_seconds, probe_duration_seconds,
@@ -6916,6 +6916,42 @@ fn set_json_field(record: &mut Value, key: &str, value: Value) {
   }
 }
 
+fn normalize_json_path_field_with_prefix(record: &mut Value, key: &str, path_prefix: &Path) {
+  if let Some(path_value) = json_string_field(record, key) {
+    let normalized = to_portable_relative_path_with_prefix(path_prefix, &path_value);
+    set_json_field(record, key, Value::String(normalized));
+  }
+}
+
+fn normalize_submission_export_task_bundle_paths(
+  bundle: &mut SubmissionExportTaskBundle,
+  path_prefix: &Path,
+) {
+  normalize_json_path_field_with_prefix(&mut bundle.submission_task, "cover_local_path", path_prefix);
+
+  for source in &mut bundle.task_source_videos {
+    normalize_json_path_field_with_prefix(source, "source_file_path", path_prefix);
+  }
+  for clip in &mut bundle.video_clips {
+    normalize_json_path_field_with_prefix(clip, "clip_path", path_prefix);
+  }
+  for merged in &mut bundle.merged_videos {
+    normalize_json_path_field_with_prefix(merged, "video_path", path_prefix);
+  }
+  for merged_source in &mut bundle.merged_source_videos {
+    normalize_json_path_field_with_prefix(merged_source, "source_file_path", path_prefix);
+  }
+  for segment in &mut bundle.task_output_segments {
+    normalize_json_path_field_with_prefix(segment, "segment_file_path", path_prefix);
+  }
+  for download in &mut bundle.video_downloads {
+    normalize_json_path_field_with_prefix(download, "local_path", path_prefix);
+  }
+  for sync_task in &mut bundle.baidu_sync_tasks {
+    normalize_json_path_field_with_prefix(sync_task, "local_path", path_prefix);
+  }
+}
+
 fn row_exists_text(
   tx: &rusqlite::Transaction<'_>,
   table: &str,
@@ -6996,6 +7032,7 @@ fn insert_row_object(
 fn collect_submission_export_task_bundle(
   conn: &rusqlite::Connection,
   task_id: &str,
+  path_prefix: &Path,
 ) -> rusqlite::Result<Option<SubmissionExportTaskBundle>> {
   let submission_task = match query_optional_row_json(
     conn,
@@ -7085,7 +7122,7 @@ fn collect_submission_export_task_bundle(
     "SELECT * FROM baidu_sync_task WHERE source_type = 'submission_merged' AND source_id = ?1 ORDER BY created_at ASC, id ASC",
     [task_id],
   )?;
-  Ok(Some(SubmissionExportTaskBundle {
+  let mut bundle = SubmissionExportTaskBundle {
     task_id: task_id.to_string(),
     submission_task,
     task_source_videos,
@@ -7100,12 +7137,15 @@ fn collect_submission_export_task_bundle(
     task_relations,
     video_downloads,
     baidu_sync_tasks,
-  }))
+  };
+  normalize_submission_export_task_bundle_paths(&mut bundle, path_prefix);
+  Ok(Some(bundle))
 }
 
 fn import_submission_task_bundle(
   tx: &rusqlite::Transaction<'_>,
   bundle: &SubmissionExportTaskBundle,
+  path_prefix: &Path,
 ) -> Result<(), String> {
   let mut submission_task = bundle.submission_task.clone();
   let task_id = json_string_field_non_empty(&submission_task, "task_id")
@@ -7115,6 +7155,7 @@ fn import_submission_task_bundle(
     "task_id",
     Value::String(task_id.clone()),
   );
+  normalize_json_path_field_with_prefix(&mut submission_task, "cover_local_path", path_prefix);
   insert_row_object(tx, "submission_task", &submission_task, &[])?;
 
   let mut source_id_map: HashMap<String, String> = HashMap::new();
@@ -7124,6 +7165,7 @@ fn import_submission_task_bundle(
     let new_source_id = generate_unique_text_id(tx, "task_source_video", "id")?;
     set_json_field(&mut source_row, "id", Value::String(new_source_id.clone()));
     set_json_field(&mut source_row, "task_id", Value::String(task_id.clone()));
+    normalize_json_path_field_with_prefix(&mut source_row, "source_file_path", path_prefix);
     insert_row_object(tx, "task_source_video", &source_row, &[])?;
     if let Some(old_id) = old_source_id {
       source_id_map.insert(old_id, new_source_id);
@@ -7133,6 +7175,7 @@ fn import_submission_task_bundle(
   for clip in &bundle.video_clips {
     let mut clip_row = clip.clone();
     set_json_field(&mut clip_row, "task_id", Value::String(task_id.clone()));
+    normalize_json_path_field_with_prefix(&mut clip_row, "clip_path", path_prefix);
     insert_row_object(tx, "video_clip", &clip_row, &["id"])?;
   }
 
@@ -7141,6 +7184,7 @@ fn import_submission_task_bundle(
     let old_merged_id = json_i64_field(merged, "id");
     let mut merged_row = merged.clone();
     set_json_field(&mut merged_row, "task_id", Value::String(task_id.clone()));
+    normalize_json_path_field_with_prefix(&mut merged_row, "video_path", path_prefix);
     insert_row_object(tx, "merged_video", &merged_row, &["id"])?;
     let new_merged_id = tx.last_insert_rowid();
     if let Some(old_id) = old_merged_id {
@@ -7173,6 +7217,7 @@ fn import_submission_task_bundle(
       "segment_id",
       Value::String(next_segment_id),
     );
+    normalize_json_path_field_with_prefix(&mut segment_row, "segment_file_path", path_prefix);
     insert_row_object(tx, "task_output_segment", &segment_row, &[])?;
   }
 
@@ -7204,6 +7249,11 @@ fn import_submission_task_bundle(
         set_json_field(&mut merged_source_row, "source_id", Value::Null);
       }
     }
+    normalize_json_path_field_with_prefix(
+      &mut merged_source_row,
+      "source_file_path",
+      path_prefix,
+    );
     insert_row_object(tx, "merged_source_video", &merged_source_row, &["id"])?;
   }
 
@@ -7304,7 +7354,8 @@ fn import_submission_task_bundle(
   let mut download_id_map: HashMap<i64, i64> = HashMap::new();
   for download in &bundle.video_downloads {
     let old_download_id = json_i64_field(download, "id");
-    let download_row = download.clone();
+    let mut download_row = download.clone();
+    normalize_json_path_field_with_prefix(&mut download_row, "local_path", path_prefix);
     insert_row_object(tx, "video_download", &download_row, &["id"])?;
     if let Some(old_id) = old_download_id {
       let new_id = tx.last_insert_rowid();
@@ -7356,6 +7407,7 @@ fn import_submission_task_bundle(
         );
       }
     }
+    normalize_json_path_field_with_prefix(&mut sync_task_row, "local_path", path_prefix);
     insert_row_object(tx, "baidu_sync_task", &sync_task_row, &["id"])?;
   }
 
@@ -7398,7 +7450,9 @@ pub fn submission_export(
     };
     let mut tasks = Vec::new();
     for task_id in task_ids {
-      if let Some(task_bundle) = collect_submission_export_task_bundle(conn, &task_id)? {
+      if let Some(task_bundle) =
+        collect_submission_export_task_bundle(conn, &task_id, context.local_path_prefix.as_path())?
+      {
         tasks.push(task_bundle);
       }
     }
@@ -7523,7 +7577,7 @@ pub fn submission_import(
       }
 
       let tx = conn.transaction()?;
-      match import_submission_task_bundle(&tx, bundle) {
+      match import_submission_task_bundle(&tx, bundle, context.local_path_prefix.as_path()) {
         Ok(()) => {
           tx.commit()?;
           result.imported_tasks += 1;
@@ -14313,4 +14367,226 @@ fn has_other_queued_tasks(
       Ok(count > 0)
     })
     .map_err(|err| err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use rusqlite::Connection;
+  use serde_json::json;
+
+  fn setup_import_test_db() -> Connection {
+    let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+    conn
+      .execute_batch(
+        "
+        CREATE TABLE submission_task (
+          task_id TEXT PRIMARY KEY,
+          status TEXT,
+          title TEXT,
+          cover_local_path TEXT
+        );
+        CREATE TABLE task_source_video (
+          id TEXT PRIMARY KEY,
+          task_id TEXT,
+          source_file_path TEXT
+        );
+        CREATE TABLE merged_video (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          task_id TEXT,
+          video_path TEXT
+        );
+        CREATE TABLE task_output_segment (
+          segment_id TEXT PRIMARY KEY,
+          task_id TEXT,
+          merged_id INTEGER,
+          segment_file_path TEXT
+        );
+        ",
+      )
+      .expect("create test schema");
+    conn
+  }
+
+  #[test]
+  fn normalize_json_path_field_converts_windows_absolute_to_relative() {
+    let mut row = json!({
+      "source_file_path": r"D:\work\cut\first\mqnl\recording.mp4"
+    });
+    normalize_json_path_field_with_prefix(
+      &mut row,
+      "source_file_path",
+      Path::new("/Users/test/Downloads"),
+    );
+    assert_eq!(
+      json_string_field(&row, "source_file_path").unwrap_or_default(),
+      "work/cut/first/mqnl/recording.mp4"
+    );
+  }
+
+  #[test]
+  fn normalize_export_bundle_paths_includes_segments_and_sources() {
+    let mut bundle = SubmissionExportTaskBundle {
+      task_id: "task-1".to_string(),
+      submission_task: json!({
+        "task_id": "task-1",
+        "cover_local_path": r"D:\cover\cover.jpg"
+      }),
+      task_source_videos: vec![json!({
+        "id": "source-1",
+        "task_id": "task-1",
+        "source_file_path": r"D:\sources\source-1.mp4"
+      })],
+      video_clips: vec![json!({
+        "id": 1,
+        "task_id": "task-1",
+        "clip_path": r"D:\clips\clip-1.mp4"
+      })],
+      merged_videos: vec![json!({
+        "id": 1,
+        "task_id": "task-1",
+        "video_path": r"D:\merged\merged-1.mp4"
+      })],
+      merged_source_videos: vec![json!({
+        "id": 1,
+        "task_id": "task-1",
+        "source_file_path": r"D:\merged-sources\source-1.mp4"
+      })],
+      task_output_segments: vec![json!({
+        "segment_id": "seg-1",
+        "task_id": "task-1",
+        "segment_file_path": r"D:\segments\part-001.mp4"
+      })],
+      workflow_instances: Vec::new(),
+      workflow_steps: Vec::new(),
+      workflow_execution_logs: Vec::new(),
+      workflow_performance_metrics: Vec::new(),
+      task_relations: Vec::new(),
+      video_downloads: vec![json!({
+        "id": 1,
+        "local_path": r"D:\downloads\video.mp4"
+      })],
+      baidu_sync_tasks: vec![json!({
+        "id": 1,
+        "local_path": r"D:\sync\merged.mp4"
+      })],
+    };
+
+    normalize_submission_export_task_bundle_paths(
+      &mut bundle,
+      Path::new("/Users/test/Downloads"),
+    );
+
+    assert_eq!(
+      json_string_field(&bundle.submission_task, "cover_local_path").unwrap_or_default(),
+      "cover/cover.jpg"
+    );
+    assert_eq!(
+      json_string_field(&bundle.task_source_videos[0], "source_file_path").unwrap_or_default(),
+      "sources/source-1.mp4"
+    );
+    assert_eq!(
+      json_string_field(&bundle.video_clips[0], "clip_path").unwrap_or_default(),
+      "clips/clip-1.mp4"
+    );
+    assert_eq!(
+      json_string_field(&bundle.merged_videos[0], "video_path").unwrap_or_default(),
+      "merged/merged-1.mp4"
+    );
+    assert_eq!(
+      json_string_field(&bundle.merged_source_videos[0], "source_file_path").unwrap_or_default(),
+      "merged-sources/source-1.mp4"
+    );
+    assert_eq!(
+      json_string_field(&bundle.task_output_segments[0], "segment_file_path").unwrap_or_default(),
+      "segments/part-001.mp4"
+    );
+    assert_eq!(
+      json_string_field(&bundle.video_downloads[0], "local_path").unwrap_or_default(),
+      "downloads/video.mp4"
+    );
+    assert_eq!(
+      json_string_field(&bundle.baidu_sync_tasks[0], "local_path").unwrap_or_default(),
+      "sync/merged.mp4"
+    );
+  }
+
+  #[test]
+  fn import_bundle_stores_relative_paths_and_segments() {
+    let mut conn = setup_import_test_db();
+    let bundle = SubmissionExportTaskBundle {
+      task_id: "task-1".to_string(),
+      submission_task: json!({
+        "task_id": "task-1",
+        "status": "COMPLETED",
+        "title": "test",
+        "cover_local_path": r"D:\cover\cover.jpg"
+      }),
+      task_source_videos: vec![json!({
+        "id": "source-old-1",
+        "task_id": "task-1",
+        "source_file_path": r"D:\source\input-1.mp4"
+      })],
+      video_clips: Vec::new(),
+      merged_videos: vec![json!({
+        "id": 101,
+        "task_id": "task-1",
+        "video_path": r"D:\merged\merged-1.mp4"
+      })],
+      merged_source_videos: Vec::new(),
+      task_output_segments: vec![json!({
+        "segment_id": "segment-old-1",
+        "task_id": "task-1",
+        "merged_id": 101,
+        "segment_file_path": r"D:\segments\part-001.mp4"
+      })],
+      workflow_instances: Vec::new(),
+      workflow_steps: Vec::new(),
+      workflow_execution_logs: Vec::new(),
+      workflow_performance_metrics: Vec::new(),
+      task_relations: Vec::new(),
+      video_downloads: Vec::new(),
+      baidu_sync_tasks: Vec::new(),
+    };
+
+    let tx = conn.transaction().expect("begin tx");
+    import_submission_task_bundle(&tx, &bundle, Path::new("/Users/test/Downloads"))
+      .expect("import bundle");
+    tx.commit().expect("commit tx");
+
+    let stored_cover: String = conn
+      .query_row(
+        "SELECT cover_local_path FROM submission_task WHERE task_id = 'task-1'",
+        [],
+        |row| row.get(0),
+      )
+      .expect("load cover path");
+    assert_eq!(stored_cover, "cover/cover.jpg");
+
+    let stored_source: String = conn
+      .query_row(
+        "SELECT source_file_path FROM task_source_video WHERE task_id = 'task-1' LIMIT 1",
+        [],
+        |row| row.get(0),
+      )
+      .expect("load source path");
+    assert_eq!(stored_source, "source/input-1.mp4");
+
+    let merged_row_id: i64 = conn
+      .query_row(
+        "SELECT id FROM merged_video WHERE task_id = 'task-1' LIMIT 1",
+        [],
+        |row| row.get(0),
+      )
+      .expect("load merged id");
+    let (stored_segment_path, segment_merged_id): (String, Option<i64>) = conn
+      .query_row(
+        "SELECT segment_file_path, merged_id FROM task_output_segment WHERE task_id = 'task-1' LIMIT 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+      )
+      .expect("load segment");
+    assert_eq!(stored_segment_path, "segments/part-001.mp4");
+    assert_eq!(segment_merged_id, Some(merged_row_id));
+  }
 }

@@ -67,6 +67,32 @@ pub fn to_stored_local_path_with_prefix(prefix: &Path, value: &str) -> String {
   trimmed.to_string()
 }
 
+fn absolute_like_to_portable_relative_text(value: &str) -> String {
+  let trimmed = value.trim();
+  if trimmed.is_empty() {
+    return String::new();
+  }
+  let normalized = trimmed.replace('\\', "/");
+  let without_drive = if is_windows_drive_absolute(trimmed) && normalized.len() >= 2 {
+    normalized[2..].to_string()
+  } else {
+    normalized
+  };
+  let without_root = without_drive.trim_start_matches('/');
+  normalize_relative_path_text(without_root)
+}
+
+pub fn to_portable_relative_path_with_prefix(prefix: &Path, value: &str) -> String {
+  let stored = to_stored_local_path_with_prefix(prefix, value);
+  if stored.trim().is_empty() {
+    return String::new();
+  }
+  if is_absolute_like_path(&stored) {
+    return absolute_like_to_portable_relative_text(&stored);
+  }
+  normalize_relative_path_text(&stored)
+}
+
 pub fn to_stored_local_path(db: &Db, value: &str) -> String {
   let prefix = load_local_path_prefix(db);
   to_stored_local_path_with_prefix(prefix.as_path(), value)
@@ -108,4 +134,31 @@ pub fn to_absolute_local_path_opt_with_prefix(
       Some(path.to_string_lossy().to_string())
     }
   })
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn portable_relative_for_path_under_prefix() {
+    let prefix = Path::new("/data/videos");
+    let actual = to_portable_relative_path_with_prefix(prefix, "/data/videos/task/output/part-01.mp4");
+    assert_eq!(actual, "task/output/part-01.mp4");
+  }
+
+  #[test]
+  fn portable_relative_for_windows_absolute_path() {
+    let prefix = Path::new("/Users/demo/Downloads");
+    let actual =
+      to_portable_relative_path_with_prefix(prefix, r"D:\work\cut\mqnl\recording\source.mp4");
+    assert_eq!(actual, "work/cut/mqnl/recording/source.mp4");
+  }
+
+  #[test]
+  fn portable_relative_for_relative_path() {
+    let prefix = Path::new("/Users/demo/Downloads");
+    let actual = to_portable_relative_path_with_prefix(prefix, r"task\output\part-01.mp4");
+    assert_eq!(actual, "task/output/part-01.mp4");
+  }
 }
