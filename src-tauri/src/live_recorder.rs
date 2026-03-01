@@ -1069,22 +1069,6 @@ fn run_record_loop(
               FlvParsedItem::Header(header) => {
                 cache.set_header(header.clone());
                 pipeline.on_stream_header();
-                if segment.is_none() {
-                  let mut new_segment = open_segment(
-                    &context,
-                    &room_id,
-                    &current_file_path,
-                    &current_title,
-                    segment_index,
-                    &settings,
-                    &room_info,
-                    nickname.as_deref(),
-                  )?;
-                  cache.write_preamble(&mut new_segment)?;
-                  pipeline.reset_on_new_segment();
-                  segment_start = Instant::now();
-                  segment = Some(new_segment);
-                }
               }
               FlvParsedItem::Tag(mut tag) => {
                 let mut decision = pipeline.process_tag(&mut tag);
@@ -1156,48 +1140,63 @@ fn run_record_loop(
                 }
 
                 if pending_split && is_video_keyframe(&tag) {
-                  if cache.has_header() {
-                    if let Some(mut seg) = segment.take() {
-                      let record_id = seg.record_id;
-                      let file_path = seg.file_path.clone();
-                      seg.finish("COMPLETED", Some("分段切换"))?;
-                      drop(seg);
-                      spawn_segment_remux(context.clone(), record_id, file_path);
+                  current_title = pending_title
+                    .take()
+                    .unwrap_or_else(|| load_current_title(&context, &room_id, &current_title));
+                  if segment.is_some() {
+                    if cache.has_header() {
+                      if let Some(mut seg) = segment.take() {
+                        let record_id = seg.record_id;
+                        let file_path = seg.file_path.clone();
+                        seg.finish("COMPLETED", Some("分段切换"))?;
+                        drop(seg);
+                        spawn_segment_remux(context.clone(), record_id, file_path);
+                      }
+                      segment_index += 1;
+                      current_file_path = build_record_path(
+                        &settings.file_name_template,
+                        &base_dir,
+                        &room_info,
+                        nickname.as_deref(),
+                        &record_start_date,
+                        segment_index,
+                      );
+                      update_current_file(&context, &room_id, &current_file_path);
+                    } else {
+                      append_log(
+                        &context.app_log_path,
+                        &format!("stream_split_skip room={} reason=no_header", room_id),
+                      );
                     }
-                    segment_index += 1;
-                    current_title = pending_title
-                      .take()
-                      .unwrap_or_else(|| load_current_title(&context, &room_id, &current_title));
-                    current_file_path = build_record_path(
-                      &settings.file_name_template,
-                      &base_dir,
-                      &room_info,
-                      nickname.as_deref(),
-                      &record_start_date,
-                      segment_index,
-                    );
-                    update_current_file(&context, &room_id, &current_file_path);
-                    let mut new_segment = open_segment(
-                      &context,
-                      &room_id,
-                      &current_file_path,
-                      &current_title,
-                      segment_index,
-                      &settings,
-                      &room_info,
-                      nickname.as_deref(),
-                    )?;
-                    cache.write_preamble(&mut new_segment)?;
-                    pipeline.reset_on_new_segment();
-                    segment_start = Instant::now();
-                    segment = Some(new_segment);
-                    pending_split = false;
-                  } else {
+                  }
+                  pending_split = false;
+                }
+
+                if segment.is_none() {
+                  if !should_open_segment_on_tag(&tag) {
+                    continue;
+                  }
+                  if !cache.has_header() {
                     append_log(
                       &context.app_log_path,
                       &format!("stream_split_skip room={} reason=no_header", room_id),
                     );
+                    continue;
                   }
+                  let mut new_segment = open_segment(
+                    &context,
+                    &room_id,
+                    &current_file_path,
+                    &current_title,
+                    segment_index,
+                    &settings,
+                    &room_info,
+                    nickname.as_deref(),
+                  )?;
+                  cache.write_preamble(&mut new_segment)?;
+                  pipeline.reset_on_new_segment();
+                  segment_start = Instant::now();
+                  segment = Some(new_segment);
                 }
 
                 if let Some(seg) = segment.as_mut() {
@@ -1343,7 +1342,27 @@ fn is_video_keyframe(tag: &FlvTag) -> bool {
     return false;
   }
   let frame_type = data[0] >> 4;
-  frame_type == 1
+  if frame_type != 1 {
+    return false;
+  }
+  let codec_id = data[0] & 0x0f;
+  if (codec_id == 7 || codec_id == 12) && (data.len() < 2 || data[1] != 1) {
+    return false;
+  }
+  true
+}
+
+fn should_open_segment_on_tag(tag: &FlvTag) -> bool {
+  if tag.tag_type == 18 {
+    return false;
+  }
+  if tag.tag_type == 8 && is_audio_header_tag(tag.data()) {
+    return false;
+  }
+  if tag.tag_type == 9 && is_video_header_tag(tag.data()) {
+    return false;
+  }
+  true
 }
 
 fn is_audio_header_tag(data: &[u8]) -> bool {
@@ -2547,38 +2566,135 @@ fn fetch_stream_urls(
   auth: Option<&AuthInfo>,
   with_quality: bool,
 ) -> Result<Vec<String>, String> {
-  let mut params = vec![
-    ("cid".to_string(), room_id.to_string()),
+  let qn = if with_quality {
+    parse_quality(&settings.recording_quality)
+  } else {
+    0
+  };
+  let params = vec![
+    ("room_id".to_string(), room_id.to_string()),
+    ("no_playurl".to_string(), "0".to_string()),
+    ("mask".to_string(), "1".to_string()),
+    ("qn".to_string(), qn.to_string()),
     ("platform".to_string(), "web".to_string()),
+    ("protocol".to_string(), "0,1".to_string()),
+    ("format".to_string(), "0,1,2".to_string()),
+    ("codec".to_string(), "0,1,2".to_string()),
+    ("dolby".to_string(), "5".to_string()),
+    ("panorama".to_string(), "1".to_string()),
+    ("hdr_type".to_string(), "0,1".to_string()),
+    ("web_location".to_string(), "444.8".to_string()),
   ];
-  if with_quality {
-    let qn = parse_quality(&settings.recording_quality);
-    params.push(("qn".to_string(), qn.to_string()));
-  }
 
   let data = tauri::async_runtime::block_on(client.get_json(
-    "https://api.live.bilibili.com/room/v1/Room/playUrl",
+    "https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo",
     &params,
     auth,
-    false,
+    true,
   ))?;
 
-  let durl = data
-    .get("durl")
+  let streams = data
+    .pointer("/playurl_info/playurl/stream")
     .and_then(|value| value.as_array())
-    .ok_or("缺少直播流地址")?;
-  let mut urls = Vec::new();
-  for item in durl {
-    if let Some(url) = item.get("url").and_then(|value| value.as_str()) {
-      if !urls.contains(&url.to_string()) {
-        urls.push(url.to_string());
-      }
-    }
+    .ok_or("缺少直播流信息 playurl_info.playurl.stream")?;
+  let protocol = streams
+    .iter()
+    .find(|item| item.get("protocol_name").and_then(|value| value.as_str()) == Some("http_stream"))
+    .ok_or("未找到 http_stream 协议直播流")?;
+  let formats = protocol
+    .get("format")
+    .and_then(|value| value.as_array())
+    .ok_or("缺少直播流格式信息 format")?;
+  let format = formats
+    .iter()
+    .find(|item| item.get("format_name").and_then(|value| value.as_str()) == Some("flv"))
+    .ok_or("未找到 flv 格式直播流")?;
+  let codecs = format
+    .get("codec")
+    .and_then(|value| value.as_array())
+    .ok_or("缺少直播流编码信息 codec")?;
+  if codecs.is_empty() {
+    return Err("直播流编码为空".to_string());
   }
+
+  let mut selected_codecs: Vec<&Value> = Vec::new();
+  if with_quality {
+    selected_codecs.extend(codecs.iter().filter(|codec| codec_matches_qn(codec, qn)));
+  }
+  if selected_codecs.is_empty() {
+    selected_codecs.extend(codecs.iter());
+  }
+
+  let urls = build_stream_urls(&selected_codecs);
   if urls.is_empty() {
     return Err("直播流地址为空".to_string());
   }
   Ok(urls)
+}
+
+fn codec_matches_qn(codec: &Value, target_qn: i64) -> bool {
+  if target_qn <= 0 {
+    return true;
+  }
+  let current_qn = codec.get("current_qn").and_then(value_to_i64);
+  if current_qn == Some(target_qn) {
+    return true;
+  }
+  codec
+    .get("accept_qn")
+    .and_then(|value| value.as_array())
+    .map(|values| values.iter().any(|value| value_to_i64(value) == Some(target_qn)))
+    .unwrap_or(false)
+}
+
+fn build_stream_urls(codecs: &[&Value]) -> Vec<String> {
+  let mut preferred = Vec::new();
+  let mut fallback = Vec::new();
+  for codec in codecs {
+    let base_url = codec.get("base_url").and_then(|value| value.as_str()).unwrap_or_default();
+    let Some(url_infos) = codec.get("url_info").and_then(|value| value.as_array()) else {
+      continue;
+    };
+    for info in url_infos {
+      let host = info.get("host").and_then(|value| value.as_str()).unwrap_or_default();
+      let extra = info.get("extra").and_then(|value| value.as_str()).unwrap_or_default();
+      let Some(url) = join_stream_url(host, base_url, extra) else {
+        continue;
+      };
+      if host.contains(".mcdn.") {
+        push_unique_url(&mut fallback, url);
+      } else {
+        push_unique_url(&mut preferred, url);
+      }
+    }
+  }
+  preferred.extend(fallback);
+  preferred
+}
+
+fn push_unique_url(target: &mut Vec<String>, url: String) {
+  if !target.iter().any(|item| item == &url) {
+    target.push(url);
+  }
+}
+
+fn join_stream_url(host: &str, base_url: &str, extra: &str) -> Option<String> {
+  if base_url.is_empty() {
+    return None;
+  }
+  if base_url.starts_with("http://") || base_url.starts_with("https://") {
+    return Some(format!("{}{}", base_url, extra));
+  }
+  if host.is_empty() {
+    return None;
+  }
+  let host = host.trim_end_matches('/');
+  let base = if base_url.starts_with('/') {
+    base_url.to_string()
+  } else {
+    format!("/{}", base_url)
+  };
+  Some(format!("{}{}{}", host, base, extra))
 }
 
 fn is_hls_url(url: &str) -> bool {
@@ -2848,48 +2964,63 @@ fn parse_quality(value: &str) -> i64 {
   10000
 }
 
+fn value_to_i64(value: &Value) -> Option<i64> {
+  if let Some(raw) = value.as_i64() {
+    return Some(raw);
+  }
+  if let Some(raw) = value.as_u64() {
+    return i64::try_from(raw).ok();
+  }
+  value.as_str().and_then(|raw| raw.parse::<i64>().ok())
+}
+
 pub async fn fetch_room_info(
   client: &BilibiliClient,
   room_id: &str,
 ) -> Result<LiveRoomInfo, String> {
-  let params = vec![("room_id".to_string(), room_id.to_string())];
+  let params = vec![
+    ("room_id".to_string(), room_id.to_string()),
+    ("web_location".to_string(), "444.8".to_string()),
+  ];
   let data = client
     .get_json(
-      "https://api.live.bilibili.com/room/v1/Room/get_info",
+      "https://api.live.bilibili.com/xlive/web-room/v1/index/getInfoByRoom",
       &params,
       None,
-      false,
+      true,
     )
     .await?;
-
-  let room_id = data
+  let room_info = data.get("room_info").ok_or("缺少直播间信息 room_info")?;
+  let room_id = room_info
     .get("room_id")
-    .and_then(|value| value.as_i64())
+    .and_then(value_to_i64)
     .map(|value| value.to_string())
     .unwrap_or_else(|| room_id.to_string());
-  let uid = data
+  let uid = room_info
     .get("uid")
-    .and_then(|value| value.as_i64())
+    .and_then(value_to_i64)
     .map(|value| value.to_string())
     .unwrap_or_else(|| "0".to_string());
-  let live_status = data
+  let live_status = room_info
     .get("live_status")
-    .and_then(|value| value.as_i64())
+    .and_then(value_to_i64)
     .unwrap_or(0);
-  let title = data
+  let title = room_info
     .get("title")
     .and_then(|value| value.as_str())
     .unwrap_or("直播标题")
     .to_string();
-  let cover = data
-    .get("user_cover")
+  let cover = room_info
+    .get("cover")
     .and_then(|value| value.as_str())
+    .or_else(|| room_info.get("keyframe").and_then(|value| value.as_str()))
+    .or_else(|| room_info.get("user_cover").and_then(|value| value.as_str()))
     .map(|value| value.to_string());
-  let area_name = data
+  let area_name = room_info
     .get("area_name")
     .and_then(|value| value.as_str())
     .map(|value| value.to_string());
-  let parent_area_name = data
+  let parent_area_name = room_info
     .get("parent_area_name")
     .and_then(|value| value.as_str())
     .map(|value| value.to_string());

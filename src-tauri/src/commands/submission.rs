@@ -6,6 +6,8 @@ use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use chrono::Utc;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, CONTENT_TYPE, USER_AGENT};
@@ -138,6 +140,7 @@ pub struct SubmissionTaskInput {
   pub title: String,
   pub description: Option<String>,
   pub cover_url: Option<String>,
+  pub cover_data_url: Option<String>,
   pub partition_id: i64,
   pub collection_id: Option<i64>,
   pub tags: Option<String>,
@@ -321,6 +324,8 @@ fn load_integrate_current_bvid(config: Option<&Value>) -> bool {
 pub struct SubmissionEditTaskInput {
   pub title: String,
   pub description: Option<String>,
+  pub cover_url: Option<String>,
+  pub cover_data_url: Option<String>,
   pub partition_id: i64,
   pub collection_id: Option<i64>,
   pub tags: Option<String>,
@@ -348,6 +353,7 @@ pub struct SubmissionEditSubmitRequest {
   pub task_id: String,
   pub task: SubmissionEditTaskInput,
   pub segments: Vec<SubmissionEditSegmentInput>,
+  pub sync_remote_update: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -377,6 +383,25 @@ pub struct SubmissionEditUploadStatusRequest {
 #[serde(rename_all = "camelCase")]
 pub struct SubmissionEditUploadClearRequest {
   pub task_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmissionEditUpdateSourcesRequest {
+  pub task_id: String,
+  pub source_videos: Vec<SourceVideoInput>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmissionUploadCoverRequest {
+  pub image_data_url: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmissionCoverLocalPreviewRequest {
+  pub file_path: String,
 }
 
 #[derive(Deserialize)]
@@ -431,6 +456,7 @@ pub struct SubmissionTaskRecord {
   pub title: String,
   pub description: Option<String>,
   pub cover_url: Option<String>,
+  pub cover_local_path: Option<String>,
   pub partition_id: i64,
   pub tags: Option<String>,
   pub topic_id: Option<i64>,
@@ -737,6 +763,16 @@ pub async fn submission_create(
   };
   let task_id = uuid::Uuid::new_v4().to_string();
   let now = now_rfc3339();
+  let normalized_collection_id = request.task.collection_id.filter(|value| *value > 0);
+  let normalized_cover_url = normalize_optional_text(request.task.cover_url.clone());
+  let normalized_cover_data_url = normalize_optional_text(request.task.cover_data_url.clone());
+  let cover_local_path = match normalized_cover_data_url.as_deref() {
+    Some(data_url) => match save_task_cover_image_from_data_url(&context, &task_id, data_url) {
+      Ok(path) => Some(path),
+      Err(err) => return Ok(ApiResponse::error(err)),
+    },
+    None => None,
+  };
   append_log(
     &state.app_log_path,
     &format!("submission_create_start task_id={}", task_id),
@@ -765,21 +801,22 @@ pub async fn submission_create(
     let normalized_baidu_sync_filename =
       normalize_baidu_sync_filename(request.task.baidu_sync_filename.as_deref());
     conn.execute(
-      "INSERT INTO submission_task (task_id, status, priority, title, description, cover_url, partition_id, tags, topic_id, mission_id, activity_title, video_type, collection_id, bvid, aid, created_at, updated_at, bilibili_uid, baidu_uid, segment_prefix, baidu_sync_enabled, baidu_sync_path, baidu_sync_filename) \
-       VALUES (?1, 'PENDING', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, NULL, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+      "INSERT INTO submission_task (task_id, status, priority, title, description, cover_url, cover_local_path, partition_id, tags, topic_id, mission_id, activity_title, video_type, collection_id, bvid, aid, created_at, updated_at, bilibili_uid, baidu_uid, segment_prefix, baidu_sync_enabled, baidu_sync_path, baidu_sync_filename) \
+       VALUES (?1, 'PENDING', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, NULL, NULL, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
       params![
         &task_id,
         if request.task.priority.unwrap_or(false) { 1 } else { 0 },
         &request.task.title,
         request.task.description.as_deref(),
-        request.task.cover_url.as_deref(),
+        normalized_cover_url.as_deref(),
+        cover_local_path.as_deref(),
         request.task.partition_id,
         request.task.tags.as_deref(),
         request.task.topic_id,
         request.task.mission_id,
         request.task.activity_title.as_deref(),
         &request.task.video_type,
-        request.task.collection_id,
+        normalized_collection_id,
         &now,
         &now,
         bilibili_uid,
@@ -2360,6 +2397,18 @@ async fn try_restore_merged_from_baidu(
         return Ok(BaiduRestoreResult::Ready(local_path_buf));
       }
     }
+    if status == 2 {
+      let _ = reset_baidu_download_record(context, record_id);
+      let _ = ensure_remote_restore_relation(context, &merged.task_id, record_id);
+      append_log(
+        app_log_path,
+        &format!(
+          "submission_baidu_restore_requeue merged_id={} record_id={} reason=local_missing",
+          merged.id, record_id
+        ),
+      );
+      return Ok(BaiduRestoreResult::Queued);
+    }
     if status == 3 {
       let _ = reset_baidu_download_record(context, record_id);
     }
@@ -2544,6 +2593,48 @@ fn update_remote_restore_status(
       Ok(())
     })
     .map_err(|err| err.to_string())
+}
+
+fn should_defer_recovery_for_remote_restore(
+  context: &SubmissionContext,
+  task_id: &str,
+) -> Result<bool, String> {
+  let has_remote_restore = context
+    .db
+    .with_conn(|conn| {
+      let mut stmt = conn.prepare(
+        "SELECT 1 FROM task_relations WHERE submission_task_id = ?1 AND relation_type = 'REMOTE_RESTORE' LIMIT 1",
+      )?;
+      let mut rows = stmt.query([task_id])?;
+      Ok(rows.next()?.is_some())
+    })
+    .map_err(|err| err.to_string())?;
+  if !has_remote_restore {
+    return Ok(false);
+  }
+
+  let has_pending_restore = context
+    .db
+    .with_conn(|conn| {
+      let mut stmt = conn.prepare(
+        "SELECT 1 FROM task_relations \
+         WHERE submission_task_id = ?1 \
+           AND relation_type = 'REMOTE_RESTORE' \
+           AND COALESCE(workflow_status, '') != 'READY' \
+         LIMIT 1",
+      )?;
+      let mut rows = stmt.query([task_id])?;
+      Ok(rows.next()?.is_some())
+    })
+    .map_err(|err| err.to_string())?;
+  if has_pending_restore {
+    return Ok(true);
+  }
+
+  let workflow_status = load_workflow_status(context, task_id)?
+    .map(|record| record.status)
+    .unwrap_or_default();
+  Ok(workflow_status == "VIDEO_DOWNLOADING")
 }
 
 async fn resume_resegment_after_restore(
@@ -4855,12 +4946,16 @@ pub fn submission_delete_preview(
   }
   let context = SubmissionContext::new(&state);
   let mut files: Vec<DeleteFilePreview> = Vec::new();
+  let mut file_seen = HashSet::new();
   let base_dir = resolve_submission_base_dir(&context, trimmed);
   if path_exists(&base_dir) {
-    files.push(DeleteFilePreview {
-      path: base_dir.to_string_lossy().to_string(),
-      conflicts: Vec::new(),
-    });
+    let path = base_dir.to_string_lossy().to_string();
+    if file_seen.insert(path.clone()) {
+      files.push(DeleteFilePreview {
+        path,
+        conflicts: Vec::new(),
+      });
+    }
   }
   let source_paths = match load_source_video_paths(&context, trimmed) {
     Ok(list) => list,
@@ -4874,7 +4969,25 @@ pub fn submission_delete_preview(
       Ok(conflicts) => conflicts,
       Err(err) => return ApiResponse::error(err),
     };
-    files.push(DeleteFilePreview { path, conflicts });
+    if file_seen.insert(path.clone()) {
+      files.push(DeleteFilePreview { path, conflicts });
+    }
+  }
+  let cover_paths = match load_task_cover_local_paths(&context, trimmed) {
+    Ok(list) => list,
+    Err(err) => return ApiResponse::error(err),
+  };
+  for path in cover_paths {
+    if !path_exists(Path::new(&path)) {
+      continue;
+    }
+    let conflicts = match find_active_references(&context, trimmed, &path) {
+      Ok(conflicts) => conflicts,
+      Err(err) => return ApiResponse::error(err),
+    };
+    if file_seen.insert(path.clone()) {
+      files.push(DeleteFilePreview { path, conflicts });
+    }
   }
   ApiResponse::success(SubmissionDeletePreview {
     task_id: trimmed.to_string(),
@@ -4883,17 +4996,19 @@ pub fn submission_delete_preview(
 }
 
 #[tauri::command]
-pub fn submission_detail(
+pub async fn submission_detail(
   state: State<'_, AppState>,
   task_id: String,
-) -> ApiResponse<SubmissionTaskDetail> {
+) -> Result<ApiResponse<SubmissionTaskDetail>, String> {
   let context = SubmissionContext::new(&state);
+  let upload_context = UploadContext::new(&state);
   append_log(
     &state.app_log_path,
     &format!("submission_detail_request task_id={}", task_id),
   );
   match load_task_detail(&context, &task_id) {
-    Ok(detail) => {
+    Ok(mut detail) => {
+      hydrate_task_cover_for_display(&context, &upload_context, &mut detail.task).await;
       append_log(
         &state.app_log_path,
         &format!(
@@ -4905,14 +5020,14 @@ pub fn submission_detail(
           if detail.workflow_config.is_some() { 1 } else { 0 }
         ),
       );
-      ApiResponse::success(detail)
+      Ok(ApiResponse::success(detail))
     }
     Err(err) => {
       append_log(
         &state.app_log_path,
         &format!("submission_detail_fail task_id={} err={}", task_id, err),
       );
-      ApiResponse::error(format!("Failed to load task detail: {}", err))
+      Ok(ApiResponse::error(format!("Failed to load task detail: {}", err)))
     }
   }
 }
@@ -5163,33 +5278,35 @@ pub fn submission_delete_merged_video(
 }
 
 #[tauri::command]
-pub fn submission_edit_prepare(
+pub async fn submission_edit_prepare(
   state: State<'_, AppState>,
   task_id: String,
-) -> ApiResponse<SubmissionTaskDetail> {
+) -> Result<ApiResponse<SubmissionTaskDetail>, String> {
   let context = SubmissionContext::new(&state);
+  let upload_context = UploadContext::new(&state);
   let task_id = task_id.trim();
   if task_id.is_empty() {
-    return ApiResponse::error("任务ID不能为空");
+    return Ok(ApiResponse::error("任务ID不能为空"));
   }
   let mut detail = match load_task_detail(&context, task_id) {
     Ok(detail) => detail,
-    Err(err) => return ApiResponse::error(format!("Failed to load task detail: {}", err)),
+    Err(err) => return Ok(ApiResponse::error(format!("Failed to load task detail: {}", err))),
   };
+  hydrate_task_cover_for_display(&context, &upload_context, &mut detail.task).await;
   if let Err(err) = ensure_editable_detail(&detail) {
-    return ApiResponse::error(err);
+    return Ok(ApiResponse::error(err));
   }
   if !detail.output_segments.is_empty() {
-    return ApiResponse::success(detail);
+    return Ok(ApiResponse::success(detail));
   }
   let merged = match load_latest_merged_video(&context, task_id) {
     Ok(Some(merged)) => merged,
-    Ok(None) => return ApiResponse::error("未找到合并视频"),
-    Err(err) => return ApiResponse::error(err),
+    Ok(None) => return Ok(ApiResponse::error("未找到合并视频")),
+    Err(err) => return Ok(ApiResponse::error(err)),
   };
   let merged_path = merged.video_path.clone().unwrap_or_default();
   if merged_path.trim().is_empty() {
-    return ApiResponse::error("合并视频路径为空");
+    return Ok(ApiResponse::error("合并视频路径为空"));
   }
   let part_name = build_part_title(detail.task.segment_prefix.as_deref(), 1);
   let has_upload = merged.upload_cid.unwrap_or(0) > 0
@@ -5233,7 +5350,7 @@ pub fn submission_edit_prepare(
     upload_chunk_size: 0,
     upload_last_part_index: 0,
   });
-  ApiResponse::success(detail)
+  Ok(ApiResponse::success(detail))
 }
 
 #[tauri::command]
@@ -5522,6 +5639,105 @@ pub async fn submission_edit_reupload_segment(
 }
 
 #[tauri::command]
+pub fn submission_edit_update_sources(
+  state: State<'_, AppState>,
+  request: SubmissionEditUpdateSourcesRequest,
+) -> Result<ApiResponse<String>, String> {
+  let context = SubmissionContext::new(&state);
+  let task_id = request.task_id.trim().to_string();
+  if task_id.is_empty() {
+    return Ok(ApiResponse::error("任务ID不能为空"));
+  }
+  let detail = match load_task_detail(&context, &task_id) {
+    Ok(detail) => detail,
+    Err(err) => return Ok(ApiResponse::error(err)),
+  };
+  if let Err(err) = ensure_editable_detail(&detail) {
+    return Ok(ApiResponse::error(err));
+  }
+  if let Err(err) = validate_source_video_inputs(&request.source_videos) {
+    return Ok(ApiResponse::error(err));
+  }
+  if let Err(err) = replace_source_videos(&context, &task_id, &request.source_videos) {
+    return Ok(ApiResponse::error(format!("更新源视频失败: {}", err)));
+  }
+  let now = now_rfc3339();
+  if let Err(err) = context.db.with_conn(|conn| {
+    conn.execute(
+      "UPDATE submission_task SET updated_at = ?1 WHERE task_id = ?2",
+      (&now, &task_id),
+    )?;
+    Ok(())
+  }) {
+    return Ok(ApiResponse::error(format!("更新任务时间失败: {}", err)));
+  }
+  Ok(ApiResponse::success("源视频更新成功".to_string()))
+}
+
+#[tauri::command]
+pub async fn submission_upload_cover(
+  state: State<'_, AppState>,
+  request: SubmissionUploadCoverRequest,
+) -> Result<ApiResponse<String>, String> {
+  let image_data_url = request.image_data_url.trim().to_string();
+  if image_data_url.is_empty() {
+    return Ok(ApiResponse::error("封面数据不能为空"));
+  }
+  let upload_context = UploadContext::new(&state);
+  let mut auth = match load_auth_or_refresh(&upload_context, "submission_upload_cover").await {
+    Ok(auth) => auth,
+    Err(err) => return Ok(ApiResponse::error(err)),
+  };
+  let csrf = match auth.csrf.clone() {
+    Some(value) => value,
+    None => {
+      auth = match refresh_auth(&upload_context, "submission_upload_cover_csrf").await {
+        Ok(auth) => auth,
+        Err(err) => return Ok(ApiResponse::error(err)),
+      };
+      match auth.csrf.clone() {
+        Some(value) => value,
+        None => return Ok(ApiResponse::error("登录信息缺少CSRF")),
+      }
+    }
+  };
+  let cover_url = match upload_cover_with_refresh(&upload_context, &auth, &csrf, &image_data_url).await
+  {
+    Ok(url) => url,
+    Err(err) => return Ok(ApiResponse::error(err)),
+  };
+  Ok(ApiResponse::success(cover_url))
+}
+
+#[tauri::command]
+pub fn submission_cover_local_preview(
+  request: SubmissionCoverLocalPreviewRequest,
+) -> Result<ApiResponse<String>, String> {
+  let raw_path = request.file_path.trim();
+  if raw_path.is_empty() {
+    return Ok(ApiResponse::error("封面文件路径不能为空"));
+  }
+
+  let path = PathBuf::from(raw_path);
+  let bytes = match fs::read(&path) {
+    Ok(data) => data,
+    Err(err) => return Ok(ApiResponse::error(format!("读取封面文件失败: {}", err))),
+  };
+  if bytes.is_empty() {
+    return Ok(ApiResponse::error("封面文件为空"));
+  }
+
+  let mime = match detect_image_mime(&bytes, &path) {
+    Some(value) => value,
+    None => return Ok(ApiResponse::error("不支持的封面格式，请选择 JPG/PNG/WEBP")),
+  };
+
+  let encoded = STANDARD.encode(bytes);
+  let data_url = format!("data:{};base64,{}", mime, encoded);
+  Ok(ApiResponse::success(data_url))
+}
+
+#[tauri::command]
 pub fn submission_edit_upload_status(
   state: State<'_, AppState>,
   request: SubmissionEditUploadStatusRequest,
@@ -5564,11 +5780,12 @@ pub async fn submission_edit_submit(
   request: SubmissionEditSubmitRequest,
 ) -> Result<ApiResponse<String>, String> {
   let context = SubmissionContext::new(&state);
+  let sync_remote_update = request.sync_remote_update.unwrap_or(true);
   let task_id = request.task_id.trim().to_string();
   if task_id.is_empty() {
     return Ok(ApiResponse::error("任务ID不能为空"));
   }
-  let mut detail = match load_task_detail(&context, &task_id) {
+  let detail = match load_task_detail(&context, &task_id) {
     Ok(detail) => detail,
     Err(err) => return Ok(ApiResponse::error(err)),
   };
@@ -5638,42 +5855,27 @@ pub async fn submission_edit_submit(
       title: part_name.to_string(),
     });
   }
-  let upload_context = UploadContext::new(&state);
-  let mut auth = match load_auth_or_refresh(&upload_context, "submission_edit_prepare").await {
-    Ok(auth) => auth,
-    Err(err) => return Ok(ApiResponse::error(err)),
-  };
-  let csrf = match auth.csrf.clone() {
-    Some(value) => value,
-    None => {
-      auth = match refresh_auth(&upload_context, "submission_edit_prepare_csrf").await {
-        Ok(auth) => auth,
-        Err(err) => return Ok(ApiResponse::error(err)),
-      };
-      match auth.csrf.clone() {
-        Some(value) => value,
-        None => return Ok(ApiResponse::error("登录信息缺少CSRF")),
-      }
-    }
-  };
-  let mut aid = detail.task.aid.unwrap_or(0);
-  if aid <= 0 {
-    let bvid = detail.task.bvid.clone().unwrap_or_default();
-    aid = fetch_aid_with_refresh(&upload_context, &auth, &bvid)
-      .await
-      .unwrap_or(0);
-    if aid <= 0 {
-      return Ok(ApiResponse::error("无法获取AID，无法编辑"));
-    }
-    let _ = update_submission_aid(&context, &task_id, aid);
-    detail.task.aid = Some(aid);
-  }
   let original_collection_id = detail.task.collection_id.unwrap_or(0);
   let mut task = detail.task.clone();
   task.title = title.to_string();
   task.description = request.task.description.clone();
+  let next_cover_url = normalize_optional_text(request.task.cover_url.clone());
+  let next_cover_data_url = normalize_optional_text(request.task.cover_data_url.clone());
+  task.cover_url = next_cover_url.clone();
+  if let Some(data_url) = next_cover_data_url.as_deref() {
+    let stored_path = match save_task_cover_image_from_data_url(&context, &task_id, data_url) {
+      Ok(path) => path,
+      Err(err) => return Ok(ApiResponse::error(err)),
+    };
+    task.cover_local_path = Some(stored_path);
+  } else if next_cover_url.is_none() {
+    if let Err(err) = remove_task_cover_image_for_record(&context, &task_id, task.cover_local_path.as_deref()) {
+      return Ok(ApiResponse::error(err));
+    }
+    task.cover_local_path = None;
+  }
   task.partition_id = request.task.partition_id;
-  task.collection_id = request.task.collection_id;
+  task.collection_id = request.task.collection_id.filter(|value| *value > 0);
   task.tags = Some(tags.clone());
   task.video_type = request.task.video_type.clone();
   task.segment_prefix = request.task.segment_prefix.clone();
@@ -5687,67 +5889,103 @@ pub async fn submission_edit_submit(
     let trimmed = activity_title.trim().to_string();
     task.activity_title = if trimmed.is_empty() { None } else { Some(trimmed) };
   }
-  task.aid = Some(aid);
-  if let Err(err) =
-    submit_video_edit_with_refresh(&upload_context, &auth, &task, &parts, aid, &csrf).await
-  {
-    return Ok(ApiResponse::error(err));
-  }
-  let next_collection_id = task.collection_id.unwrap_or(0);
-  if next_collection_id != original_collection_id {
-    append_log(
-      &upload_context.app_log_path,
-      &format!(
-        "submission_edit_collection_change task_id={} from={} to={}",
-        task_id, original_collection_id, next_collection_id
-      ),
-    );
-    if next_collection_id > 0 {
-      if let Err(err) = switch_video_collection_with_refresh(
-        &upload_context,
-        &auth,
-        &task.title,
-        next_collection_id,
-        aid,
-        &csrf,
-      )
-      .await
-      {
-        if is_collection_not_found_error(&err) {
-          append_log(
-            &upload_context.app_log_path,
-            &format!(
-              "submission_edit_collection_switch_skip task_id={} collection_id={} err={}",
-              task_id, next_collection_id, err
-            ),
-          );
-        } else {
-          append_log(
-            &upload_context.app_log_path,
-            &format!(
-              "submission_edit_collection_switch_fail task_id={} collection_id={} err={}",
-              task_id, next_collection_id, err
-            ),
-          );
-          return Ok(ApiResponse::error(err));
+  if sync_remote_update {
+    let upload_context = UploadContext::new(&state);
+    let mut auth = match load_auth_or_refresh(&upload_context, "submission_edit_prepare").await {
+      Ok(auth) => auth,
+      Err(err) => return Ok(ApiResponse::error(err)),
+    };
+    let csrf = match auth.csrf.clone() {
+      Some(value) => value,
+      None => {
+        auth = match refresh_auth(&upload_context, "submission_edit_prepare_csrf").await {
+          Ok(auth) => auth,
+          Err(err) => return Ok(ApiResponse::error(err)),
+        };
+        match auth.csrf.clone() {
+          Some(value) => value,
+          None => return Ok(ApiResponse::error("登录信息缺少CSRF")),
         }
+      }
+    };
+    let mut aid = detail.task.aid.unwrap_or(0);
+    if aid <= 0 {
+      let bvid = detail.task.bvid.clone().unwrap_or_default();
+      aid = fetch_aid_with_refresh(&upload_context, &auth, &bvid)
+        .await
+        .unwrap_or(0);
+      if aid <= 0 {
+        return Ok(ApiResponse::error("无法获取AID，无法编辑"));
+      }
+      let _ = update_submission_aid(&context, &task_id, aid);
+    }
+    task.aid = Some(aid);
+    if let Err(err) =
+      submit_video_edit_with_refresh(&upload_context, &auth, &task, &parts, aid, &csrf).await
+    {
+      return Ok(ApiResponse::error(err));
+    }
+    let next_collection_id = task.collection_id.unwrap_or(0);
+    if next_collection_id != original_collection_id {
+      append_log(
+        &upload_context.app_log_path,
+        &format!(
+          "submission_edit_collection_change task_id={} from={} to={}",
+          task_id, original_collection_id, next_collection_id
+        ),
+      );
+      if next_collection_id > 0 {
+        if let Err(err) = switch_video_collection_with_refresh(
+          &upload_context,
+          &auth,
+          &task.title,
+          next_collection_id,
+          aid,
+          &csrf,
+        )
+        .await
+        {
+          if is_collection_not_found_error(&err) {
+            append_log(
+              &upload_context.app_log_path,
+              &format!(
+                "submission_edit_collection_switch_skip task_id={} collection_id={} err={}",
+                task_id, next_collection_id, err
+              ),
+            );
+          } else {
+            append_log(
+              &upload_context.app_log_path,
+              &format!(
+                "submission_edit_collection_switch_fail task_id={} collection_id={} err={}",
+                task_id, next_collection_id, err
+              ),
+            );
+            return Ok(ApiResponse::error(err));
+          }
+        }
+      } else {
+        append_log(
+          &upload_context.app_log_path,
+          &format!(
+            "submission_edit_collection_switch_skip task_id={} collection_id=0",
+            task_id
+          ),
+        );
       }
     } else {
       append_log(
         &upload_context.app_log_path,
         &format!(
-          "submission_edit_collection_switch_skip task_id={} collection_id=0",
-          task_id
+          "submission_edit_collection_skip task_id={} from={} to={}",
+          task_id, original_collection_id, next_collection_id
         ),
       );
     }
   } else {
     append_log(
-      &upload_context.app_log_path,
-      &format!(
-        "submission_edit_collection_skip task_id={} from={} to={}",
-        task_id, original_collection_id, next_collection_id
-      ),
+      &context.app_log_path,
+      &format!("submission_edit_remote_skip task_id={} mode=local_only", task_id),
     );
   }
   if let Err(err) = update_submission_task_for_edit(&context, &task_id, &task) {
@@ -5758,7 +5996,7 @@ pub async fn submission_edit_submit(
   }
   if let Err(err) = clear_edit_upload_segments_by_task(&context, &task_id) {
     append_log(
-      &upload_context.app_log_path,
+      &context.app_log_path,
       &format!(
         "submission_edit_clear_cache_fail task_id={} err={}",
         task_id, err
@@ -5913,6 +6151,9 @@ pub fn submission_delete(
       if is_file && source_video_set.contains(path) {
         cleanup_empty_parent_dir(&state.app_log_path, target);
       }
+    }
+    if !request.delete_task {
+      let _ = clear_missing_task_cover_local_path(&context, &task_id);
     }
   }
 
@@ -7383,7 +7624,7 @@ fn load_tasks(
         st.created_at DESC";
       let sql = match (status.as_ref(), like_query.as_ref()) {
         (Some(_), Some(_)) => format!(
-          "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+          "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
                   wi.status, wi.current_step, wi.progress \
            FROM submission_task st \
@@ -7392,7 +7633,7 @@ fn load_tasks(
           order_by
         ),
         (Some(_), None) => format!(
-          "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+          "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
                   wi.status, wi.current_step, wi.progress \
            FROM submission_task st \
@@ -7401,7 +7642,7 @@ fn load_tasks(
           order_by
         ),
         (None, Some(_)) => format!(
-          "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+          "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
                   wi.status, wi.current_step, wi.progress \
            FROM submission_task st \
@@ -7410,7 +7651,7 @@ fn load_tasks(
           order_by
         ),
         (None, None) => format!(
-          "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+          "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
                   wi.status, wi.current_step, wi.progress \
            FROM submission_task st \
@@ -7446,10 +7687,10 @@ fn load_tasks(
 }
 
 fn map_submission_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<SubmissionTaskRecord> {
-  let has_integrated_downloads: i64 = row.get(23)?;
-  let workflow_status = row.get::<_, Option<String>>(24)?;
-  let workflow_step = row.get::<_, Option<String>>(25)?;
-  let workflow_progress: Option<f64> = row.get(26)?;
+  let has_integrated_downloads: i64 = row.get(24)?;
+  let workflow_status = row.get::<_, Option<String>>(25)?;
+  let workflow_step = row.get::<_, Option<String>>(26)?;
+  let workflow_progress: Option<f64> = row.get(27)?;
   let workflow_status = workflow_status.map(|status| WorkflowStatusRecord {
     status,
     current_step: workflow_step,
@@ -7463,23 +7704,24 @@ fn map_submission_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<SubmissionTa
     title: row.get(3)?,
     description: row.get(4)?,
     cover_url: row.get(5)?,
-    partition_id: row.get(6)?,
-    tags: row.get(7)?,
-    topic_id: row.get(8)?,
-    mission_id: row.get(9)?,
-    activity_title: row.get(10)?,
-    video_type: row.get(11)?,
-    collection_id: row.get(12)?,
-    bvid: row.get(13)?,
-    aid: row.get(14)?,
-    remote_state: row.get(15)?,
-    reject_reason: row.get(16)?,
-    created_at: row.get(17)?,
-    updated_at: row.get(18)?,
-    segment_prefix: row.get(19)?,
-    baidu_sync_enabled: row.get::<_, i64>(20)? != 0,
-    baidu_sync_path: row.get(21)?,
-    baidu_sync_filename: row.get(22)?,
+    cover_local_path: row.get(6)?,
+    partition_id: row.get(7)?,
+    tags: row.get(8)?,
+    topic_id: row.get(9)?,
+    mission_id: row.get(10)?,
+    activity_title: row.get(11)?,
+    video_type: row.get(12)?,
+    collection_id: row.get(13)?,
+    bvid: row.get(14)?,
+    aid: row.get(15)?,
+    remote_state: row.get(16)?,
+    reject_reason: row.get(17)?,
+    created_at: row.get(18)?,
+    updated_at: row.get(19)?,
+    segment_prefix: row.get(20)?,
+    baidu_sync_enabled: row.get::<_, i64>(21)? != 0,
+    baidu_sync_path: row.get(22)?,
+    baidu_sync_filename: row.get(23)?,
     has_integrated_downloads: has_integrated_downloads != 0,
     workflow_status,
   })
@@ -7503,7 +7745,7 @@ fn load_task_detail(
     .db
     .with_conn(|conn| {
       let task = conn.query_row(
-        "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
+        "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
                 CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
                 wi.status, wi.current_step, wi.progress \
          FROM submission_task st \
@@ -7641,6 +7883,242 @@ fn load_task_detail(
   }
 
   Ok(detail)
+}
+
+fn update_submission_cover_url(
+  context: &SubmissionContext,
+  task_id: &str,
+  cover_url: Option<&str>,
+) -> Result<(), String> {
+  context
+    .db
+    .with_conn(|conn| {
+      conn.execute(
+        "UPDATE submission_task SET cover_url = ?1 WHERE task_id = ?2",
+        (cover_url, task_id),
+      )?;
+      Ok(())
+    })
+    .map_err(|err| err.to_string())
+}
+
+fn update_submission_cover_local_path(
+  context: &SubmissionContext,
+  task_id: &str,
+  cover_local_path: Option<&str>,
+) -> Result<(), String> {
+  context
+    .db
+    .with_conn(|conn| {
+      conn.execute(
+        "UPDATE submission_task SET cover_local_path = ?1 WHERE task_id = ?2",
+        (cover_local_path, task_id),
+      )?;
+      Ok(())
+    })
+    .map_err(|err| err.to_string())
+}
+
+async fn fetch_cover_url_by_bvid_once(
+  context: &UploadContext,
+  auth: Option<&AuthInfo>,
+  bvid: &str,
+) -> Result<Option<String>, String> {
+  let url = format!("{}/x/web-interface/view", context.bilibili.base_url());
+  let params = vec![("bvid".to_string(), bvid.to_string())];
+  let data = context
+    .bilibili
+    .get_json(&url, &params, auth, false)
+    .await?;
+  Ok(
+    data
+      .get("pic")
+      .and_then(|value| value.as_str())
+      .map(|value| value.trim().to_string())
+      .filter(|value| !value.is_empty()),
+  )
+}
+
+async fn fetch_cover_url_by_bvid(
+  context: &UploadContext,
+  auth: Option<&AuthInfo>,
+  bvid: &str,
+) -> Option<String> {
+  let trimmed = bvid.trim();
+  if trimmed.is_empty() {
+    return None;
+  }
+
+  if let Some(current_auth) = auth {
+    match fetch_cover_url_by_bvid_once(context, Some(current_auth), trimmed).await {
+      Ok(Some(url)) => return Some(url),
+      Ok(None) => {}
+      Err(err) => {
+        append_log(
+          &context.app_log_path,
+          &format!("submission_cover_fetch_fail mode=auth bvid={} err={}", trimmed, err),
+        );
+        if is_auth_error(&err) {
+          match refresh_auth(context, "fetch_cover_by_bvid").await {
+            Ok(refreshed) => {
+              match fetch_cover_url_by_bvid_once(context, Some(&refreshed), trimmed).await {
+                Ok(Some(url)) => return Some(url),
+                Ok(None) => {}
+                Err(refresh_err) => {
+                  append_log(
+                    &context.app_log_path,
+                    &format!(
+                      "submission_cover_fetch_fail mode=refreshed_auth bvid={} err={}",
+                      trimmed, refresh_err
+                    ),
+                  );
+                }
+              }
+            }
+            Err(refresh_err) => {
+              append_log(
+                &context.app_log_path,
+                &format!(
+                  "submission_cover_fetch_refresh_fail bvid={} err={}",
+                  trimmed, refresh_err
+                ),
+              );
+            }
+          }
+        }
+      }
+    }
+  }
+
+  match fetch_cover_url_by_bvid_once(context, None, trimmed).await {
+    Ok(Some(url)) => Some(url),
+    Ok(None) => None,
+    Err(err) => {
+      append_log(
+        &context.app_log_path,
+        &format!("submission_cover_fetch_fail mode=anonymous bvid={} err={}", trimmed, err),
+      );
+      None
+    }
+  }
+}
+
+async fn hydrate_task_cover_for_display(
+  context: &SubmissionContext,
+  upload_context: &UploadContext,
+  task: &mut SubmissionTaskRecord,
+) {
+  let raw_cover_local_path = normalize_optional_text(task.cover_local_path.clone());
+  let runtime_cover_local_path =
+    resolve_runtime_cover_local_path(context, raw_cover_local_path.clone());
+  if raw_cover_local_path.is_some() && runtime_cover_local_path.is_none() {
+    let _ = update_submission_cover_local_path(context, &task.task_id, None);
+  }
+  task.cover_local_path = runtime_cover_local_path;
+
+  let normalized_cover_url = normalize_optional_text(task.cover_url.clone());
+  if normalized_cover_url.is_some() {
+    task.cover_url = normalized_cover_url;
+    return;
+  }
+  if task.cover_local_path.is_some() {
+    task.cover_url = None;
+    return;
+  }
+
+  let Some(bvid) = normalize_optional_text(task.bvid.clone()) else {
+    task.cover_url = None;
+    return;
+  };
+
+  append_log(
+    &context.app_log_path,
+    &format!(
+      "submission_cover_hydrate_fetch task_id={} bvid={} local={} remote={}",
+      task.task_id,
+      bvid,
+      if task.cover_local_path.is_some() { 1 } else { 0 },
+      if normalized_cover_url.is_some() { 1 } else { 0 }
+    ),
+  );
+  let auth = upload_context
+    .login_store
+    .load_auth_info(&upload_context.db)
+    .ok()
+    .flatten();
+  if let Some(url) = fetch_cover_url_by_bvid(upload_context, auth.as_ref(), &bvid).await {
+    let _ = update_submission_cover_url(context, &task.task_id, Some(url.as_str()));
+    append_log(
+      &context.app_log_path,
+      &format!("submission_cover_hydrate_ok task_id={} bvid={} cover={}", task.task_id, bvid, url),
+    );
+    task.cover_url = Some(url);
+  } else {
+    append_log(
+      &context.app_log_path,
+      &format!("submission_cover_hydrate_empty task_id={} bvid={}", task.task_id, bvid),
+    );
+    task.cover_url = None;
+  }
+}
+
+fn load_task_cover_local_paths(
+  context: &SubmissionContext,
+  task_id: &str,
+) -> Result<Vec<String>, String> {
+  let stored_paths = context
+    .db
+    .with_conn(|conn| {
+      let mut stmt =
+        conn.prepare("SELECT cover_local_path FROM submission_task WHERE task_id = ?1 LIMIT 1")?;
+      let path: Option<String> = stmt
+        .query_row([task_id], |row| row.get::<_, Option<String>>(0))
+        .optional()?
+        .flatten();
+      Ok(path.into_iter().collect::<Vec<_>>())
+    })
+    .map_err(|err| err.to_string())?;
+
+  let mut result = Vec::new();
+  for stored in stored_paths {
+    let runtime = to_runtime_submission_path(context, &stored);
+    if runtime.trim().is_empty() {
+      continue;
+    }
+    result.push(runtime);
+  }
+  Ok(result)
+}
+
+fn clear_missing_task_cover_local_path(
+  context: &SubmissionContext,
+  task_id: &str,
+) -> Result<(), String> {
+  let stored_path = context
+    .db
+    .with_conn(|conn| {
+      let mut stmt =
+        conn.prepare("SELECT cover_local_path FROM submission_task WHERE task_id = ?1 LIMIT 1")?;
+      let value: Option<String> = stmt
+        .query_row([task_id], |row| row.get::<_, Option<String>>(0))
+        .optional()?
+        .flatten();
+      Ok(value)
+    })
+    .map_err(|err| err.to_string())?;
+
+  let Some(stored_path) = normalize_optional_text(stored_path) else {
+    return Ok(());
+  };
+  let runtime_path = to_runtime_submission_path(context, &stored_path);
+  if runtime_path.trim().is_empty() {
+    update_submission_cover_local_path(context, task_id, None)?;
+    return Ok(());
+  }
+  if !path_exists(Path::new(&runtime_path)) {
+    update_submission_cover_local_path(context, task_id, None)?;
+  }
+  Ok(())
 }
 
 pub fn create_workflow_instance_for_task_with_type(
@@ -8396,7 +8874,9 @@ const UPLOAD_SEGMENT_RETRY_LIMIT: u32 = 3;
 const SUBMISSION_QUEUE_RETRY_LIMIT: u32 = 3;
 const SUBMISSION_QUEUE_RETRY_BASE_DELAY_SECS: u64 = 10;
 const SUBMISSION_QUEUE_RETRY_MAX_DELAY_SECS: u64 = 120;
-const REMOTE_AUDIT_STATUS: &str = "is_pubing,not_pubed";
+const REMOTE_AUDIT_STATUS_REVIEWING: &str = "is_pubing";
+const REMOTE_AUDIT_STATUS_REJECTED: &str = "not_pubed";
+const REMOTE_AUDIT_STATUS_SCOPE: &str = "is_pubing|not_pubed";
 const REMOTE_DEBUG_BVID: &str = "BV1VJkFBZENQ";
 const UPLOAD_RETRY_BASE_DELAY_SECS: u64 = 2;
 const UPLOAD_RETRY_MAX_DELAY_SECS: u64 = 30;
@@ -9159,7 +9639,7 @@ async fn refresh_submission_remote_state(
       task_bvids.len(),
       remote_map.len(),
       missing_bvids.len(),
-      REMOTE_AUDIT_STATUS
+      REMOTE_AUDIT_STATUS_SCOPE
     ),
   );
   if remote_map.is_empty() {
@@ -9168,7 +9648,7 @@ async fn refresh_submission_remote_state(
       &format!(
         "submission_remote_refresh_remote_empty tasks={} status={}",
         task_bvids.len(),
-        REMOTE_AUDIT_STATUS
+        REMOTE_AUDIT_STATUS_SCOPE
       ),
     );
   } else if !missing_bvids.is_empty() {
@@ -9247,7 +9727,31 @@ async fn fetch_remote_audit_map(
   context: &SubmissionQueueContext,
   auth: &AuthInfo,
 ) -> Result<HashMap<String, RemoteAuditInfo>, String> {
-  let status = REMOTE_AUDIT_STATUS;
+  let mut result = fetch_remote_audit_map_by_status(context, auth, REMOTE_AUDIT_STATUS_REJECTED).await?;
+  let reviewing_map =
+    fetch_remote_audit_map_by_status(context, auth, REMOTE_AUDIT_STATUS_REVIEWING).await?;
+  let rejected_count = result.len();
+  let reviewing_count = reviewing_map.len();
+  for (bvid, info) in reviewing_map {
+    result.insert(bvid, info);
+  }
+  append_log(
+    &context.app_log_path,
+    &format!(
+      "submission_remote_fetch_merge_summary rejected_items={} reviewing_items={} merged_items={} override=reviewing",
+      rejected_count,
+      reviewing_count,
+      result.len()
+    ),
+  );
+  Ok(result)
+}
+
+async fn fetch_remote_audit_map_by_status(
+  context: &SubmissionQueueContext,
+  auth: &AuthInfo,
+  status: &str,
+) -> Result<HashMap<String, RemoteAuditInfo>, String> {
   let mut page = 1_i64;
   let page_size = 20_i64;
   let mut result = HashMap::new();
@@ -9264,8 +9768,8 @@ async fn fetch_remote_audit_map(
     append_log(
       &context.app_log_path,
       &format!(
-        "submission_remote_fetch_request url=https://member.bilibili.com/x/web/archives?{}",
-        query
+        "submission_remote_fetch_request status={} url=https://member.bilibili.com/x/web/archives?{}",
+        status, query
       ),
     );
     let data = context
@@ -9280,8 +9784,8 @@ async fn fetch_remote_audit_map(
     append_log(
       &context.app_log_path,
       &format!(
-        "submission_remote_fetch_response page={} data={}",
-        page,
+        "submission_remote_fetch_response status={} page={} data={}",
+        status, page,
         truncate_log_value(&data)
       ),
     );
@@ -9348,6 +9852,14 @@ async fn fetch_remote_audit_map(
     page += 1;
   }
 
+  append_log(
+    &context.app_log_path,
+    &format!(
+      "submission_remote_fetch_status_summary status={} items={}",
+      status,
+      result.len()
+    ),
+  );
   Ok(result)
 }
 
@@ -9375,6 +9887,25 @@ async fn recover_submission_tasks(context: SubmissionQueueContext) {
   }
 
   for task_id in processing_ids {
+    match should_defer_recovery_for_remote_restore(&submission_context, &task_id) {
+      Ok(true) => {
+        append_log(
+          &context.app_log_path,
+          &format!("submission_recover_wait_remote_restore task_id={}", task_id),
+        );
+        continue;
+      }
+      Ok(false) => {}
+      Err(err) => {
+        append_log(
+          &context.app_log_path,
+          &format!(
+            "submission_recover_remote_restore_check_fail task_id={} err={}",
+            task_id, err
+          ),
+        );
+      }
+    }
     let _ = update_submission_status(&submission_context, &task_id, "PENDING");
     let _ = set_workflow_instance_status(&submission_context, &task_id, "PENDING");
     let context_clone = submission_context.clone();
@@ -10284,6 +10815,183 @@ fn build_upload_url(endpoint: &str, upos_uri: &str) -> String {
   format!("https:{}{}", endpoint, path)
 }
 
+fn decode_image_data_url(image_data_url: &str) -> Result<Vec<u8>, String> {
+  let raw = image_data_url.trim();
+  if !raw.starts_with("data:image/") {
+    return Err("封面数据格式不合法，请重新选择图片".to_string());
+  }
+  let (meta, encoded) = raw
+    .split_once(',')
+    .ok_or_else(|| "封面数据格式不合法，请重新选择图片".to_string())?;
+  if !meta.contains(";base64") {
+    return Err("封面数据格式不合法，请重新选择图片".to_string());
+  }
+  STANDARD
+    .decode(encoded)
+    .map_err(|_| "封面数据解码失败，请重新选择图片".to_string())
+}
+
+fn resolve_task_cover_target_path(context: &SubmissionContext, task_id: &str) -> PathBuf {
+  resolve_submission_base_dir(context, task_id)
+    .join("cover")
+    .join("cover.jpg")
+}
+
+fn save_task_cover_image_from_data_url(
+  context: &SubmissionContext,
+  task_id: &str,
+  image_data_url: &str,
+) -> Result<String, String> {
+  let bytes = decode_image_data_url(image_data_url)?;
+  let target_path = resolve_task_cover_target_path(context, task_id);
+  let cover_dir = target_path
+    .parent()
+    .ok_or_else(|| "封面目录无效".to_string())?;
+  fs::create_dir_all(cover_dir).map_err(|err| format!("创建封面目录失败: {}", err))?;
+
+  if let Ok(entries) = fs::read_dir(cover_dir) {
+    for entry in entries.flatten() {
+      let path = entry.path();
+      if !path.is_file() {
+        continue;
+      }
+      let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+      if !name.starts_with("cover.") {
+        continue;
+      }
+      if path == target_path {
+        continue;
+      }
+      let _ = fs::remove_file(path);
+    }
+  }
+
+  fs::write(&target_path, bytes).map_err(|err| format!("保存本地封面失败: {}", err))?;
+  Ok(to_stored_submission_path(
+    context,
+    target_path.to_string_lossy().as_ref(),
+  ))
+}
+
+fn remove_task_cover_image_for_record(
+  context: &SubmissionContext,
+  task_id: &str,
+  stored_cover_path: Option<&str>,
+) -> Result<(), String> {
+  let fallback = resolve_task_cover_target_path(context, task_id);
+  let target = stored_cover_path
+    .map(|value| to_runtime_submission_path(context, value))
+    .filter(|value| !value.trim().is_empty())
+    .map(PathBuf::from)
+    .unwrap_or(fallback);
+
+  if path_exists(&target) {
+    fs::remove_file(&target).map_err(|err| format!("删除本地封面失败: {}", err))?;
+  }
+
+  if let Some(parent) = target.parent() {
+    if parent.ends_with("cover") {
+      if fs::read_dir(parent).map(|mut it| it.next().is_none()).unwrap_or(false) {
+        let _ = fs::remove_dir(parent);
+      }
+    }
+  }
+  Ok(())
+}
+
+fn detect_image_mime(bytes: &[u8], path: &Path) -> Option<&'static str> {
+  if bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF {
+    return Some("image/jpeg");
+  }
+  if bytes.len() >= 8
+    && bytes[0] == 0x89
+    && bytes[1] == 0x50
+    && bytes[2] == 0x4E
+    && bytes[3] == 0x47
+    && bytes[4] == 0x0D
+    && bytes[5] == 0x0A
+    && bytes[6] == 0x1A
+    && bytes[7] == 0x0A
+  {
+    return Some("image/png");
+  }
+  if bytes.len() >= 12
+    && &bytes[0..4] == b"RIFF"
+    && &bytes[8..12] == b"WEBP"
+  {
+    return Some("image/webp");
+  }
+  if bytes.len() >= 6 && (&bytes[0..6] == b"GIF87a" || &bytes[0..6] == b"GIF89a") {
+    return Some("image/gif");
+  }
+
+  let ext = path
+    .extension()
+    .and_then(|value| value.to_str())
+    .map(|value| value.to_ascii_lowercase());
+  match ext.as_deref() {
+    Some("jpg") | Some("jpeg") => Some("image/jpeg"),
+    Some("png") => Some("image/png"),
+    Some("webp") => Some("image/webp"),
+    Some("gif") => Some("image/gif"),
+    _ => None,
+  }
+}
+
+async fn upload_cover(
+  context: &UploadContext,
+  auth: &AuthInfo,
+  csrf: &str,
+  image_data_url: &str,
+) -> Result<String, String> {
+  let cover = image_data_url.trim();
+  if !cover.starts_with("data:image/") || !cover.contains(";base64,") {
+    return Err("封面数据格式不合法，请重新选择图片".to_string());
+  }
+  let url = "https://member.bilibili.com/x/vu/web/cover/up";
+  let params = vec![("ts".to_string(), Utc::now().timestamp_millis().to_string())];
+  let form = vec![
+    ("csrf".to_string(), csrf.to_string()),
+    ("cover".to_string(), cover.to_string()),
+  ];
+  let data = context
+    .bilibili
+    .post_form(url, &params, &form, Some(auth))
+    .await?;
+  let cover_url = data
+    .get("url")
+    .and_then(|value| value.as_str())
+    .map(|value| value.trim())
+    .filter(|value| !value.is_empty())
+    .ok_or_else(|| "封面上传成功但响应缺少URL".to_string())?;
+  Ok(cover_url.to_string())
+}
+
+async fn upload_cover_with_refresh(
+  context: &UploadContext,
+  auth: &AuthInfo,
+  csrf: &str,
+  image_data_url: &str,
+) -> Result<String, String> {
+  match upload_cover(context, auth, csrf, image_data_url).await {
+    Ok(url) => Ok(url),
+    Err(err) => {
+      if !is_auth_error(&err) {
+        return Err(err);
+      }
+      let auth = refresh_auth(context, "submission_upload_cover").await?;
+      let csrf = auth
+        .csrf
+        .clone()
+        .ok_or_else(|| "登录信息缺少CSRF".to_string())?;
+      upload_cover(context, &auth, &csrf, image_data_url).await
+    }
+  }
+}
+
 async fn submit_video_add_with_refresh(
   context: &UploadContext,
   auth: &AuthInfo,
@@ -10586,6 +11294,7 @@ fn build_submission_videos(parts: &[UploadedVideoPart]) -> Vec<Value> {
 
 fn build_add_payload(task: &SubmissionTaskRecord, parts: &[UploadedVideoPart]) -> Value {
   let copyright = if task.video_type == "ORIGINAL" { 1 } else { 2 };
+  let human_type2 = task.partition_id;
   let tags = task.tags.clone().unwrap_or_default();
   let desc = task.description.clone().unwrap_or_default();
   let cover = task.cover_url.clone().unwrap_or_default();
@@ -10598,7 +11307,7 @@ fn build_add_payload(task: &SubmissionTaskRecord, parts: &[UploadedVideoPart]) -
     "title": task.title,
     "copyright": copyright,
     "tid": task.partition_id,
-    "human_type2": task.partition_id,
+    "human_type2": human_type2,
     "tag": tags,
     "desc_format_id": 9999,
     "desc": desc,
@@ -10638,6 +11347,7 @@ fn build_add_payload(task: &SubmissionTaskRecord, parts: &[UploadedVideoPart]) -
 
 fn build_edit_payload(task: &SubmissionTaskRecord, parts: &[UploadedVideoPart], aid: i64) -> Value {
   let copyright = if task.video_type == "ORIGINAL" { 1 } else { 2 };
+  let human_type2 = task.partition_id;
   let tags = task.tags.clone().unwrap_or_default();
   let desc = task.description.clone().unwrap_or_default();
   let cover = task.cover_url.clone().unwrap_or_default();
@@ -10651,6 +11361,7 @@ fn build_edit_payload(task: &SubmissionTaskRecord, parts: &[UploadedVideoPart], 
     "title": task.title,
     "copyright": copyright,
     "tid": task.partition_id,
+    "human_type2": human_type2,
     "tag": tags,
     "desc_format_id": 9999,
     "desc": desc,
@@ -11369,7 +12080,46 @@ fn load_update_sources(
   Ok(Some(sources))
 }
 
-#[allow(dead_code)]
+fn validate_source_video_inputs(sources: &[SourceVideoInput]) -> Result<(), String> {
+  if sources.is_empty() {
+    return Err("请至少添加一个源视频".to_string());
+  }
+  for (index, source) in sources.iter().enumerate() {
+    let row = index + 1;
+    let source_path = source.source_file_path.trim();
+    if source_path.is_empty() {
+      return Err(format!("第{}行源视频路径不能为空", row));
+    }
+    let start = match source
+      .start_time
+      .as_deref()
+      .map(|value| value.trim())
+      .filter(|value| !value.is_empty())
+    {
+      Some(value) => parse_time_to_seconds(value)
+        .ok_or_else(|| format!("第{}行开始时间格式不合法", row))?,
+      None => 0.0,
+    };
+    let end = match source
+      .end_time
+      .as_deref()
+      .map(|value| value.trim())
+      .filter(|value| !value.is_empty())
+    {
+      Some(value) => parse_time_to_seconds(value)
+        .ok_or_else(|| format!("第{}行结束时间格式不合法", row))?,
+      None => return Err(format!("第{}行结束时间不能为空", row)),
+    };
+    if start < 0.0 || end <= 0.0 {
+      return Err(format!("第{}行时间范围不合法", row));
+    }
+    if start >= end {
+      return Err(format!("第{}行开始时间必须小于结束时间", row));
+    }
+  }
+  Ok(())
+}
+
 fn replace_source_videos(
   context: &SubmissionContext,
   task_id: &str,
@@ -12209,10 +12959,12 @@ fn update_submission_task_for_edit(
     .db
     .with_conn(|conn| {
       conn.execute(
-        "UPDATE submission_task SET title = ?1, description = ?2, partition_id = ?3, tags = ?4, topic_id = ?5, mission_id = ?6, activity_title = ?7, video_type = ?8, collection_id = ?9, segment_prefix = ?10, updated_at = ?11 WHERE task_id = ?12",
+        "UPDATE submission_task SET title = ?1, description = ?2, cover_url = ?3, cover_local_path = ?4, partition_id = ?5, tags = ?6, topic_id = ?7, mission_id = ?8, activity_title = ?9, video_type = ?10, collection_id = ?11, segment_prefix = ?12, updated_at = ?13 WHERE task_id = ?14",
         (
           &task.title,
           task.description.as_deref(),
+          task.cover_url.as_deref(),
+          task.cover_local_path.as_deref(),
           task.partition_id,
           task.tags.as_deref(),
           task.topic_id,
@@ -13196,6 +13948,17 @@ fn to_runtime_submission_path_opt(
   value: Option<String>,
 ) -> Option<String> {
   to_absolute_local_path_opt_with_prefix(context.local_path_prefix.as_path(), value)
+}
+
+fn resolve_runtime_cover_local_path(
+  context: &SubmissionContext,
+  stored_path: Option<String>,
+) -> Option<String> {
+  let runtime_path = to_runtime_submission_path_opt(context, stored_path);
+  runtime_path
+    .map(|value| value.trim().to_string())
+    .filter(|value| !value.is_empty())
+    .filter(|value| path_exists(Path::new(value)))
 }
 
 fn to_stored_submission_path(context: &SubmissionContext, value: &str) -> String {

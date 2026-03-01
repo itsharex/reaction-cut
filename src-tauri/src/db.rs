@@ -63,6 +63,7 @@ impl Db {
     let _ = conn.execute("ALTER TABLE submission_task ADD COLUMN topic_id INTEGER", []);
     let _ = conn.execute("ALTER TABLE submission_task ADD COLUMN mission_id INTEGER", []);
     let _ = conn.execute("ALTER TABLE submission_task ADD COLUMN activity_title TEXT", []);
+    let _ = conn.execute("ALTER TABLE submission_task ADD COLUMN cover_local_path TEXT", []);
     let _ = conn.execute("ALTER TABLE video_download ADD COLUMN cid INTEGER", []);
     let _ = conn.execute("ALTER TABLE video_download ADD COLUMN content TEXT", []);
     let _ = conn.execute(

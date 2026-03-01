@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import {
   confirm as dialogConfirm,
   message as dialogMessage,
@@ -12,6 +12,14 @@ import { invokeCommand } from "../lib/tauri";
 import { formatDateTime } from "../lib/format";
 import BaiduSyncPathPicker from "../components/BaiduSyncPathPicker";
 import BaiduRemoteFilePicker from "../components/BaiduRemoteFilePicker";
+import CoverCropModal from "../components/CoverCropModal";
+import useSubmissionCover from "../hooks/useSubmissionCover";
+import {
+  buildEditBaselineFromDetail,
+  collectCurrentTags,
+  resolveEditChangedModules,
+  validateSourceVideos,
+} from "../lib/submissionEditDiff";
 
 const statusFilters = [
   { value: "ALL", label: "全部" },
@@ -46,6 +54,9 @@ export default function SubmissionSection() {
   const [taskForm, setTaskForm] = useState({
     title: "",
     description: "",
+    coverUrl: "",
+    coverLocalPath: "",
+    coverDataUrl: "",
     partitionId: "",
     collectionId: "",
     activityTopicId: "",
@@ -68,6 +79,8 @@ export default function SubmissionSection() {
   const [activityOptions, setActivityOptions] = useState([]);
   const [activityLoading, setActivityLoading] = useState(false);
   const [activityMessage, setActivityMessage] = useState("");
+  const [activityKeyword, setActivityKeyword] = useState("");
+  const [activityDropdownOpen, setActivityDropdownOpen] = useState(false);
   const [tasks, setTasks] = useState([]);
   const [currentUpProfile, setCurrentUpProfile] = useState({ uid: 0, name: "" });
   const [selectedTaskIds, setSelectedTaskIds] = useState(() => new Set());
@@ -163,10 +176,22 @@ export default function SubmissionSection() {
   const [editingSegmentId, setEditingSegmentId] = useState("");
   const [editingSegmentName, setEditingSegmentName] = useState("");
   const [draggingSegmentId, setDraggingSegmentId] = useState("");
+  const [editSubmitConfirmOpen, setEditSubmitConfirmOpen] = useState(false);
+  const [editSubmitConfirmSyncRemote, setEditSubmitConfirmSyncRemote] = useState(true);
+  const [pendingEditSubmitPayload, setPendingEditSubmitPayload] = useState(null);
+  const [pendingEditChangedLabel, setPendingEditChangedLabel] = useState("");
+  const [pendingEditNeedRemote, setPendingEditNeedRemote] = useState(false);
+  const [coverPreviewModalOpen, setCoverPreviewModalOpen] = useState(false);
+  const [coverPreviewModalSrc, setCoverPreviewModalSrc] = useState("");
+  const [localCoverDataPreviewSrc, setLocalCoverDataPreviewSrc] = useState("");
+  const [coverProxyPreviewSrc, setCoverProxyPreviewSrc] = useState("");
   const [submittingEdit, setSubmittingEdit] = useState(false);
+  const [editBaseline, setEditBaseline] = useState(null);
   const lastDetailTaskIdRef = useRef(null);
   const lastEditTaskIdRef = useRef(null);
   const dragStateRef = useRef({ activeId: "", overId: "" });
+  const coverProxyCacheRef = useRef(new Map());
+  const activityRequestSeqRef = useRef(0);
   const isCreateView = submissionView === "create";
   const isDetailView = submissionView === "detail";
   const isEditView = submissionView === "edit";
@@ -174,14 +199,39 @@ export default function SubmissionSection() {
   const quickFillPageSize = 10;
   const deleteFiles = deletePreview?.files || [];
   const deleteHasFiles = deleteFiles.length > 0;
+  const buildPartitionOptionValue = (partition) => {
+    const tid = String(partition?.tid ?? "").trim();
+    if (!tid) {
+      return "";
+    }
+    return tid;
+  };
+  const parsePartitionOptionValue = (value) => {
+    return String(value || "").trim();
+  };
+  const resolvePartitionSelectValue = (partitionId, options = partitions) => {
+    const normalizedId = String(partitionId || "").trim();
+    if (!normalizedId) {
+      return "";
+    }
+    return options.some((item) => String(item.tid) === normalizedId) ? normalizedId : normalizedId;
+  };
+  const handlePartitionChange = (rawValue) => {
+    const partitionId = parsePartitionOptionValue(rawValue);
+    setTaskForm((prev) => ({
+      ...prev,
+      partitionId,
+    }));
+  };
   const activitySelectOptions = (() => {
+    const ordered = [...activityOptions];
     const currentId = Number(taskForm.activityTopicId || 0);
     if (!currentId) {
-      return activityOptions;
+      return ordered;
     }
-    const exists = activityOptions.some((item) => item.topicId === currentId);
+    const exists = ordered.some((item) => item.topicId === currentId);
     if (exists || !taskForm.activityTitle) {
-      return activityOptions;
+      return ordered;
     }
     return [
       {
@@ -191,10 +241,56 @@ export default function SubmissionSection() {
         description: "",
         activityText: "",
         activityDescription: "",
+        readCount: 0,
+        showActivityIcon: false,
       },
-      ...activityOptions,
+      ...ordered,
     ];
   })();
+  const activityFilteredOptions = (() => {
+    const keyword = String(activityKeyword || "").trim().toLowerCase();
+    if (!keyword) {
+      return activitySelectOptions;
+    }
+    const filtered = activitySelectOptions.filter((activity) => {
+      const text = [
+        activity?.name,
+        activity?.activityText,
+        activity?.description,
+        activity?.activityDescription,
+      ]
+        .map((item) => String(item || "").toLowerCase())
+        .join(" ");
+      return text.includes(keyword);
+    });
+    const currentId = Number(taskForm.activityTopicId || 0);
+    if (!currentId || filtered.some((item) => item.topicId === currentId)) {
+      return filtered;
+    }
+    const selected = activitySelectOptions.find((item) => item.topicId === currentId);
+    return selected ? [selected, ...filtered] : filtered;
+  })();
+  const {
+    coverAspectRatio,
+    coverMinWidth,
+    coverMinHeight,
+    coverCropOpen,
+    coverCropSourceUrl,
+    coverUploading,
+    coverPreviewUrl,
+    resetCoverState,
+    handleSelectCoverFile,
+    handleCloseCoverCrop,
+    handleCoverCropImageError,
+    handleConfirmCoverCrop,
+    handleClearCover,
+  } = useSubmissionCover({
+    openDialog,
+    convertFileSrc,
+    invokeCommand,
+    setTaskForm,
+    setMessage,
+  });
 
   useEffect(() => {
     editSegmentsRef.current = editSegments;
@@ -272,6 +368,9 @@ export default function SubmissionSection() {
     setTaskForm({
       title: "",
       description: "",
+      coverUrl: "",
+      coverLocalPath: "",
+      coverDataUrl: "",
       partitionId: "",
       collectionId: "",
       activityTopicId: "",
@@ -304,9 +403,13 @@ export default function SubmissionSection() {
   const openCreateView = async () => {
     setSubmissionView("create");
     setSelectedTask(null);
+    setEditBaseline(null);
+    resetCoverState();
     setMessage("");
     setQuickFillOpen(false);
     setActivityOptions([]);
+    setActivityKeyword("");
+    setActivityDropdownOpen(false);
     setActivityMessage("");
     resetFormState();
     await loadPartitions();
@@ -486,8 +589,17 @@ export default function SubmissionSection() {
     setEditingSegmentId("");
     setEditingSegmentName("");
     setDraggingSegmentId("");
+    setEditSubmitConfirmOpen(false);
+    setEditSubmitConfirmSyncRemote(true);
+    setPendingEditSubmitPayload(null);
+    setPendingEditChangedLabel("");
+    setPendingEditNeedRemote(false);
     setSubmittingEdit(false);
+    setEditBaseline(null);
+    resetCoverState();
     setQuickFillOpen(false);
+    setActivityKeyword("");
+    setActivityDropdownOpen(false);
   };
 
   const loadPartitions = async () => {
@@ -499,7 +611,10 @@ export default function SubmissionSection() {
           if (prev.partitionId) {
             return prev;
           }
-          return { ...prev, partitionId: String(data[0].tid) };
+          return {
+            ...prev,
+            partitionId: String(data[0].tid),
+          };
         });
       }
     } catch (error) {
@@ -599,14 +714,46 @@ export default function SubmissionSection() {
   };
 
   const normalizeActivityOptions = (items) => {
+    const parseReadCount = (value) => {
+      const raw = String(value ?? "").trim();
+      if (!raw) {
+        return 0;
+      }
+      const numeric = Number(raw);
+      if (Number.isFinite(numeric)) {
+        return Math.max(0, Math.floor(numeric));
+      }
+      const digits = raw.replace(/[^\d]/g, "");
+      if (!digits) {
+        return 0;
+      }
+      const parsed = Number(digits);
+      return Number.isFinite(parsed) ? Math.max(0, Math.floor(parsed)) : 0;
+    };
     return (items || [])
       .map((item) => ({
         topicId: Number(item?.topicId ?? item?.topic_id ?? 0),
         missionId: Number(item?.missionId ?? item?.mission_id ?? 0),
         name: item?.name || item?.topicName || item?.topic_name || "",
-        description: item?.description || "",
+        description: item?.description || item?.topicDescription || item?.topic_description || "",
         activityText: item?.activityText || item?.activity_text || "",
         activityDescription: item?.activityDescription || item?.activity_description || "",
+        showActivityIcon: Boolean(
+          item?.showActivityIcon ?? item?.show_activity_icon ?? false,
+        ),
+        readCount: parseReadCount(
+          item?.readCount ??
+            item?.read_count ??
+            item?.arcPlayVv ??
+            item?.arc_play_vv ??
+            item?.read ??
+            item?.viewCount ??
+            item?.view_count ??
+            item?.view ??
+            item?.pv ??
+            item?.click ??
+            item?.hot,
+        ),
       }))
       .filter((item) => item.topicId > 0 && item.name);
   };
@@ -621,15 +768,33 @@ export default function SubmissionSection() {
       activityTitle: nextTitle,
     }));
     setTags((prev) => {
+      const previousIndex = previousTitle ? prev.indexOf(previousTitle) : -1;
       let next = prev.filter((tag) => tag !== previousTitle);
-      if (nextTitle && !next.includes(nextTitle)) {
-        next = [...next, nextTitle];
+      if (!nextTitle) {
+        return next;
       }
+      const existingIndex = next.indexOf(nextTitle);
+      if (existingIndex >= 0) {
+        if (previousIndex >= 0) {
+          const [tagValue] = next.splice(existingIndex, 1);
+          const insertAt = Math.min(previousIndex, next.length);
+          next.splice(insertAt, 0, tagValue);
+        }
+        return next;
+      }
+      if (previousIndex >= 0) {
+        const insertAt = Math.min(previousIndex, next.length);
+        next.splice(insertAt, 0, nextTitle);
+        return next;
+      }
+      next = [...next, nextTitle];
       return next;
     });
+    setActivityKeyword(nextTitle);
+    setActivityDropdownOpen(false);
   };
 
-  const clearActivitySelection = () => {
+  const clearActivitySelection = ({ clearKeyword = true, closeDropdown = true } = {}) => {
     const previousTitle = taskForm.activityTitle || "";
     setTaskForm((prev) => ({
       ...prev,
@@ -637,39 +802,56 @@ export default function SubmissionSection() {
       activityMissionId: "",
       activityTitle: "",
     }));
+    if (clearKeyword) {
+      setActivityKeyword("");
+    }
+    if (closeDropdown) {
+      setActivityDropdownOpen(false);
+    }
     if (previousTitle) {
       setTags((prev) => prev.filter((tag) => tag !== previousTitle));
     }
   };
 
-  const loadActivities = async (partitionId) => {
+  const loadActivities = async (partitionId, keyword = "") => {
+    const requestSeq = activityRequestSeqRef.current + 1;
+    activityRequestSeqRef.current = requestSeq;
     setActivityLoading(true);
     setActivityMessage("");
     try {
+      const normalizedKeyword = String(keyword || "").trim();
       const data = await invokeCommand("bilibili_topics", {
         partitionId: partitionId ? Number(partitionId) : null,
+        title: normalizedKeyword || null,
       });
+      if (requestSeq !== activityRequestSeqRef.current) {
+        return;
+      }
       const mapped = normalizeActivityOptions(data);
       setActivityOptions(mapped);
       const currentId = Number(taskForm.activityTopicId || 0);
       if (currentId > 0 && mapped.length > 0 && !mapped.some((item) => item.topicId === currentId)) {
-        clearActivitySelection();
+        clearActivitySelection({ clearKeyword: false, closeDropdown: false });
       }
     } catch (error) {
+      if (requestSeq !== activityRequestSeqRef.current) {
+        return;
+      }
       setActivityOptions([]);
       setActivityMessage(error.message);
     } finally {
-      setActivityLoading(false);
+      if (requestSeq === activityRequestSeqRef.current) {
+        setActivityLoading(false);
+      }
     }
   };
 
-  const handleActivityChange = (event) => {
-    const value = event.target.value;
+  const handleActivitySelect = (value) => {
     if (!value) {
       applyActivitySelection(null);
       return;
     }
-    const target = activityOptions.find((item) => String(item.topicId) === value);
+    const target = activitySelectOptions.find((item) => String(item.topicId) === value);
     if (!target) {
       applyActivitySelection(null);
       return;
@@ -683,12 +865,51 @@ export default function SubmissionSection() {
     }
     const partitionId = Number(taskForm.partitionId || 0);
     if (!partitionId) {
+      activityRequestSeqRef.current += 1;
+      setActivityLoading(false);
       setActivityOptions([]);
-      clearActivitySelection();
+      clearActivitySelection({ clearKeyword: true, closeDropdown: true });
       return;
     }
-    loadActivities(partitionId);
-  }, [isCreateView, isEditView, taskForm.partitionId]);
+    loadActivities(partitionId, activityKeyword);
+  }, [isCreateView, isEditView, taskForm.partitionId, partitions]);
+
+  useEffect(() => {
+    if (!isCreateView && !isEditView) {
+      return undefined;
+    }
+    const partitionId = Number(taskForm.partitionId || 0);
+    if (!partitionId) {
+      return undefined;
+    }
+    const timer = window.setTimeout(() => {
+      loadActivities(partitionId, activityKeyword);
+    }, 320);
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [
+    isCreateView,
+    isEditView,
+    activityKeyword,
+  ]);
+
+  useEffect(() => {
+    if (!isCreateView) {
+      return;
+    }
+    const currentCollectionId = String(taskForm.collectionId || "").trim();
+    if (!currentCollectionId) {
+      return;
+    }
+    const exists = collections.some(
+      (collection) => String(collection.seasonId) === currentCollectionId,
+    );
+    if (exists) {
+      return;
+    }
+    setTaskForm((prev) => ({ ...prev, collectionId: "" }));
+  }, [isCreateView, collections, taskForm.collectionId]);
 
   const loadTasks = async (
     filter = statusFilter,
@@ -1056,6 +1277,7 @@ export default function SubmissionSection() {
     if (!isDetailView && !isEditView) {
       lastDetailTaskIdRef.current = null;
       lastEditTaskIdRef.current = null;
+      setEditBaseline(null);
       return;
     }
     const taskId = selectedTask?.task?.taskId;
@@ -1067,6 +1289,7 @@ export default function SubmissionSection() {
         return;
       }
       lastDetailTaskIdRef.current = taskId;
+      setEditBaseline(null);
       applyDetailToForm(selectedTask);
       return;
     }
@@ -1371,36 +1594,16 @@ export default function SubmissionSection() {
         return;
       }
     }
-    const validSources = sourceVideos.filter((item) => item.sourceFilePath.trim());
-    if (validSources.length === 0) {
-      setMessage("请至少添加一个源视频");
-      return;
-    }
-    const invalidSource = validSources.find(
-      (item) => !isVideoFilePath(item.sourceFilePath),
-    );
-    if (invalidSource) {
-      setMessage("源视频仅支持常见视频格式");
-      return;
-    }
-    const invalidTime = validSources.find((item) => {
-      const start = parseHmsToSeconds(item.startTime);
-      const end = parseHmsToSeconds(item.endTime);
-      if (start === null || end === null) {
-        return true;
-      }
-      if (start < 0 || end < 0) {
-        return true;
-      }
-      if (item.durationSeconds > 0 && end > item.durationSeconds) {
-        return true;
-      }
-      return false;
+    const sourceValidation = validateSourceVideos({
+      items: sourceVideos,
+      parseHmsToSeconds,
+      isVideoFilePath,
     });
-    if (invalidTime) {
-      setMessage("时间范围不合法，请检查开始与结束时间");
+    if (!sourceValidation.valid) {
+      setMessage(sourceValidation.message);
       return;
     }
+    const validSources = sourceValidation.validSources;
     try {
       const auth = await invokeCommand("auth_status");
       if (!auth?.loggedIn) {
@@ -1421,14 +1624,29 @@ export default function SubmissionSection() {
     }
     setCreateSubmitting(true);
     try {
+      const selectedCollectionId = (() => {
+        const raw = String(taskForm.collectionId || "").trim();
+        if (!raw) {
+          return null;
+        }
+        const exists = collections.some(
+          (collection) => String(collection.seasonId) === raw,
+        );
+        if (!exists) {
+          return null;
+        }
+        const parsed = Number(raw);
+        return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+      })();
       const payload = {
         request: {
-          task: {
-            title: taskForm.title,
-            description: taskForm.description || null,
-            coverUrl: null,
+            task: {
+              title: taskForm.title,
+              description: taskForm.description || null,
+            coverUrl: taskForm.coverUrl || null,
+            coverDataUrl: taskForm.coverDataUrl || null,
             partitionId: Number(taskForm.partitionId),
-            collectionId: taskForm.collectionId ? Number(taskForm.collectionId) : null,
+            collectionId: selectedCollectionId,
             tags: uniqueTags.join(","),
             topicId: taskForm.activityTopicId ? Number(taskForm.activityTopicId) : null,
             missionId: taskForm.activityMissionId ? Number(taskForm.activityMissionId) : null,
@@ -1478,36 +1696,16 @@ export default function SubmissionSection() {
         return;
       }
     }
-    const validSources = updateSourceVideos.filter((item) => item.sourceFilePath.trim());
-    if (validSources.length === 0) {
-      setMessage("请至少添加一个源视频");
-      return;
-    }
-    const invalidSource = validSources.find(
-      (item) => !isVideoFilePath(item.sourceFilePath),
-    );
-    if (invalidSource) {
-      setMessage("源视频仅支持常见视频格式");
-      return;
-    }
-    const invalidTime = validSources.find((item) => {
-      const start = parseHmsToSeconds(item.startTime);
-      const end = parseHmsToSeconds(item.endTime);
-      if (start === null || end === null) {
-        return true;
-      }
-      if (start < 0 || end < 0) {
-        return true;
-      }
-      if (item.durationSeconds > 0 && end > item.durationSeconds) {
-        return true;
-      }
-      return false;
+    const sourceValidation = validateSourceVideos({
+      items: updateSourceVideos,
+      parseHmsToSeconds,
+      isVideoFilePath,
     });
-    if (invalidTime) {
-      setMessage("时间范围不合法，请检查开始与结束时间");
+    if (!sourceValidation.valid) {
+      setMessage(sourceValidation.message);
       return;
     }
+    const validSources = sourceValidation.validSources;
     setUpdateSubmitting(true);
     try {
       const payload = {
@@ -1665,6 +1863,16 @@ export default function SubmissionSection() {
     if (!task) {
       return;
     }
+    const partitionId = task.partitionId ?? task.partition_id;
+    const collectionId = task.collectionId ?? task.collection_id;
+    const topicId = task.topicId ?? task.topic_id;
+    const missionId = task.missionId ?? task.mission_id;
+    const activityTitle = task.activityTitle ?? task.activity_title;
+    const coverUrl = task.coverUrl ?? task.cover_url;
+    const coverLocalPath = task.coverLocalPath ?? task.cover_local_path;
+    const baiduSyncEnabled = task.baiduSyncEnabled ?? task.baidu_sync_enabled;
+    const baiduSyncPath = task.baiduSyncPath ?? task.baidu_sync_path;
+    const baiduSyncFilename = task.baiduSyncFilename ?? task.baidu_sync_filename;
     const tagList = String(task.tags || "")
       .split(",")
       .map((item) => item.trim())
@@ -1673,19 +1881,24 @@ export default function SubmissionSection() {
       ...prev,
       title: task.title || "",
       description: task.description || "",
-      partitionId: task.partitionId ? String(task.partitionId) : "",
-      collectionId: task.collectionId ? String(task.collectionId) : "",
-      activityTopicId: task.topicId ? String(task.topicId) : "",
-      activityMissionId: task.missionId ? String(task.missionId) : "",
-      activityTitle: task.activityTitle || "",
+      coverUrl: coverUrl || "",
+      coverLocalPath: coverLocalPath || "",
+      coverDataUrl: "",
+      partitionId: partitionId ? String(partitionId) : "",
+      collectionId: collectionId ? String(collectionId) : "",
+      activityTopicId: topicId ? String(topicId) : "",
+      activityMissionId: missionId ? String(missionId) : "",
+      activityTitle: activityTitle || "",
       videoType: task.videoType || "ORIGINAL",
       priority: Boolean(task.priority),
-      baiduSyncEnabled: Boolean(task.baiduSyncEnabled),
-      baiduSyncPath: task.baiduSyncPath || "",
-      baiduSyncFilename: task.baiduSyncFilename || "",
+      baiduSyncEnabled: Boolean(baiduSyncEnabled),
+      baiduSyncPath: baiduSyncPath || "",
+      baiduSyncFilename: baiduSyncFilename || "",
     }));
     setTags(tagList);
     setTagInput("");
+    setActivityKeyword(activityTitle || "");
+    setActivityDropdownOpen(false);
   };
 
   const openQuickFill = () => {
@@ -1710,6 +1923,18 @@ export default function SubmissionSection() {
 
   const applyDetailToForm = (detail) => {
     const task = detail?.task || {};
+    const partitionId = task.partitionId ?? task.partition_id;
+    const collectionId = task.collectionId ?? task.collection_id;
+    const topicId = task.topicId ?? task.topic_id;
+    const missionId = task.missionId ?? task.mission_id;
+    const activityTitle = task.activityTitle ?? task.activity_title;
+    const coverUrl = task.coverUrl ?? task.cover_url;
+    const coverLocalPath = task.coverLocalPath ?? task.cover_local_path;
+    const videoType = task.videoType ?? task.video_type;
+    const segmentPrefix = task.segmentPrefix ?? task.segment_prefix;
+    const baiduSyncEnabled = task.baiduSyncEnabled ?? task.baidu_sync_enabled;
+    const baiduSyncPath = task.baiduSyncPath ?? task.baidu_sync_path;
+    const baiduSyncFilename = task.baiduSyncFilename ?? task.baidu_sync_filename;
     const tagList = String(task.tags || "")
       .split(",")
       .map((item) => item.trim())
@@ -1717,20 +1942,25 @@ export default function SubmissionSection() {
     setTaskForm({
       title: task.title || "",
       description: task.description || "",
-      partitionId: task.partitionId ? String(task.partitionId) : "",
-      collectionId: task.collectionId ? String(task.collectionId) : "",
-      activityTopicId: task.topicId ? String(task.topicId) : "",
-      activityMissionId: task.missionId ? String(task.missionId) : "",
-      activityTitle: task.activityTitle || "",
-      videoType: task.videoType || "ORIGINAL",
-      segmentPrefix: task.segmentPrefix || "",
+      coverUrl: coverUrl || "",
+      coverLocalPath: coverLocalPath || "",
+      coverDataUrl: "",
+      partitionId: partitionId ? String(partitionId) : "",
+      collectionId: collectionId ? String(collectionId) : "",
+      activityTopicId: topicId ? String(topicId) : "",
+      activityMissionId: missionId ? String(missionId) : "",
+      activityTitle: activityTitle || "",
+      videoType: videoType || "ORIGINAL",
+      segmentPrefix: segmentPrefix || "",
       priority: Boolean(task.priority),
-      baiduSyncEnabled: Boolean(task.baiduSyncEnabled),
-      baiduSyncPath: task.baiduSyncPath || "",
-      baiduSyncFilename: task.baiduSyncFilename || "",
+      baiduSyncEnabled: Boolean(baiduSyncEnabled),
+      baiduSyncPath: baiduSyncPath || "",
+      baiduSyncFilename: baiduSyncFilename || "",
     });
     setTags(tagList);
     setTagInput("");
+    setActivityKeyword(activityTitle || "");
+    setActivityDropdownOpen(false);
     const config = detail?.workflowConfig || {};
     const segmentation = config?.segmentationConfig || {};
     const enableSegmentation =
@@ -1844,6 +2074,7 @@ export default function SubmissionSection() {
 
   const handleDetail = async (taskId) => {
     setMessage("");
+    setEditBaseline(null);
     try {
       setSubmissionView("detail");
       setSelectedTask(null);
@@ -1908,6 +2139,13 @@ export default function SubmissionSection() {
       setSubmissionView("edit");
       setSelectedTask(null);
       setEditSegments([]);
+      setEditSubmitConfirmOpen(false);
+      setEditSubmitConfirmSyncRemote(true);
+      setPendingEditSubmitPayload(null);
+      setPendingEditChangedLabel("");
+      setPendingEditNeedRemote(false);
+      setActivityKeyword("");
+      setActivityDropdownOpen(false);
       const loadPromises = Promise.all([loadPartitions(), loadCollections()]);
       const detail = await invokeCommand("submission_edit_prepare", { taskId });
       if (!detail?.task) {
@@ -1917,6 +2155,7 @@ export default function SubmissionSection() {
       setDetailTab("basic");
       applyDetailToForm(detail);
       initEditSegments(detail);
+      setEditBaseline(buildEditBaselineFromDetail(detail));
       await loadPromises;
     } catch (error) {
       setMessage(error.message);
@@ -2028,6 +2267,7 @@ export default function SubmissionSection() {
       return;
     }
     setMessage("");
+    const taskId = selectedTask.task.taskId;
     let segmentsForSubmit = editSegments;
     if (editingSegmentId) {
       const nextName = editingSegmentName.trim();
@@ -2042,66 +2282,102 @@ export default function SubmissionSection() {
       setEditingSegmentId("");
       setEditingSegmentName("");
     }
-    if (!taskForm.title.trim()) {
-      setMessage("请输入投稿标题");
+    const changedModules = resolveEditChangedModules({
+      baseline: editBaseline,
+      taskForm,
+      tags,
+      tagInput,
+      sourceVideos,
+      editSegments: segmentsForSubmit,
+    });
+    if (changedModules.length === 0) {
+      setMessage("未检测到改动，无需提交");
       return;
     }
-    if (taskForm.title.length > 80) {
-      setMessage("投稿标题不能超过 80 个字符");
-      return;
+    const needUpdateSource = changedModules.includes("source");
+    const needEditSubmit = changedModules.includes("basic") || changedModules.includes("segments");
+    const moduleLabelMap = {
+      basic: "基本信息",
+      source: "源视频",
+      segments: "分段与上传",
+    };
+    const changedLabel = changedModules.map((key) => moduleLabelMap[key] || key).join("、");
+    let sourcePayload = [];
+    if (needUpdateSource) {
+      const sourceValidation = validateSourceVideos({
+        items: sourceVideos,
+        parseHmsToSeconds,
+        isVideoFilePath,
+      });
+      if (!sourceValidation.valid) {
+        setMessage(sourceValidation.message);
+        return;
+      }
+      sourcePayload = sourceValidation.validSources.map((item, index) => ({
+        sourceFilePath: item.sourceFilePath,
+        sortOrder: index + 1,
+        startTime: item.startTime || null,
+        endTime: item.endTime || null,
+      }));
     }
-    if (!taskForm.partitionId) {
-      setMessage("请选择B站分区");
-      return;
-    }
-    if (!taskForm.videoType) {
-      setMessage("请选择视频类型");
-      return;
-    }
-    if (taskForm.description && taskForm.description.length > 2000) {
-      setMessage("视频描述不能超过 2000 个字符");
-      return;
-    }
-    const normalizedTags = [...tags];
-    if (tagInput.trim()) {
-      normalizedTags.push(tagInput.trim());
-    }
-    const uniqueTags = Array.from(new Set(normalizedTags));
-    if (uniqueTags.length === 0) {
-      setMessage("请填写至少一个投稿标签");
-      return;
-    }
-    if (!segmentsForSubmit.length) {
-      setMessage("至少需要保留一个分P");
-      return;
-    }
-    const incompleteSegment = segmentsForSubmit.find(
-      (segment) => segment.uploadStatus !== "SUCCESS",
-    );
-    if (incompleteSegment) {
-      setMessage("存在未上传成功的分P，请处理后再提交");
-      return;
-    }
-    const emptyNameSegment = segmentsForSubmit.find(
-      (segment) => !segment.partName || !segment.partName.trim(),
-    );
-    if (emptyNameSegment) {
-      setMessage("分P名称不能为空");
-      return;
-    }
-    const emptyPathSegment = segmentsForSubmit.find(
-      (segment) => !segment.segmentFilePath || !segment.segmentFilePath.trim(),
-    );
-    if (emptyPathSegment) {
-      setMessage("分P文件路径不能为空");
-      return;
-    }
-    const missingUploadInfo = segmentsForSubmit.find(
-      (segment) => !segment.cid || !segment.fileName,
-    );
-    if (missingUploadInfo) {
-      setMessage("分P上传信息缺失，请重新上传");
-      return;
+    const uniqueTags = collectCurrentTags(tags, tagInput);
+    if (needEditSubmit) {
+      if (!taskForm.title.trim()) {
+        setMessage("请输入投稿标题");
+        return;
+      }
+      if (taskForm.title.length > 80) {
+        setMessage("投稿标题不能超过 80 个字符");
+        return;
+      }
+      if (!taskForm.partitionId) {
+        setMessage("请选择B站分区");
+        return;
+      }
+      if (!taskForm.videoType) {
+        setMessage("请选择视频类型");
+        return;
+      }
+      if (taskForm.description && taskForm.description.length > 2000) {
+        setMessage("视频描述不能超过 2000 个字符");
+        return;
+      }
+      if (uniqueTags.length === 0) {
+        setMessage("请填写至少一个投稿标签");
+        return;
+      }
+      if (!segmentsForSubmit.length) {
+        setMessage("至少需要保留一个分P");
+        return;
+      }
+      const incompleteSegment = segmentsForSubmit.find(
+        (segment) => segment.uploadStatus !== "SUCCESS",
+      );
+      if (incompleteSegment) {
+        setMessage("存在未上传成功的分P，请处理后再提交");
+        return;
+      }
+      const emptyNameSegment = segmentsForSubmit.find(
+        (segment) => !segment.partName || !segment.partName.trim(),
+      );
+      if (emptyNameSegment) {
+        setMessage("分P名称不能为空");
+        return;
+      }
+      const emptyPathSegment = segmentsForSubmit.find(
+        (segment) => !segment.segmentFilePath || !segment.segmentFilePath.trim(),
+      );
+      if (emptyPathSegment) {
+        setMessage("分P文件路径不能为空");
+        return;
+      }
+      const missingUploadInfo = segmentsForSubmit.find(
+        (segment) => !segment.cid || !segment.fileName,
+      );
+      if (missingUploadInfo) {
+        setMessage("分P上传信息缺失，请重新上传");
+        return;
+      }
     }
     const segmentPayload = segmentsForSubmit.map((segment, index) => ({
       segmentId: segment.segmentId,
@@ -2111,26 +2387,85 @@ export default function SubmissionSection() {
       cid: segment.cid ?? null,
       fileName: segment.fileName ?? null,
     }));
+    const selectedCollectionId = (() => {
+      const raw = String(taskForm.collectionId ?? "").trim();
+      if (!raw) {
+        return null;
+      }
+      const parsed = Number(raw);
+      return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+    })();
+    const taskPayload = needEditSubmit
+      ? {
+          title: taskForm.title,
+          description: taskForm.description || null,
+          coverUrl: taskForm.coverUrl || null,
+          coverDataUrl: taskForm.coverDataUrl || null,
+          partitionId: Number(taskForm.partitionId),
+          collectionId: selectedCollectionId,
+          tags: uniqueTags.join(","),
+          topicId: taskForm.activityTopicId ? Number(taskForm.activityTopicId) : null,
+          missionId: taskForm.activityMissionId ? Number(taskForm.activityMissionId) : null,
+          activityTitle: taskForm.activityTitle || null,
+          videoType: taskForm.videoType,
+          segmentPrefix: taskForm.segmentPrefix || null,
+        }
+      : null;
+    setPendingEditSubmitPayload({
+      taskId,
+      needUpdateSource,
+      sourcePayload,
+      needEditSubmit,
+      task: taskPayload,
+      segments: segmentPayload,
+    });
+    setPendingEditChangedLabel(changedLabel);
+    setPendingEditNeedRemote(needEditSubmit);
+    setEditSubmitConfirmSyncRemote(true);
+    setEditSubmitConfirmOpen(true);
+  };
+
+  const handleCloseEditSubmitConfirm = () => {
+    if (submittingEdit) {
+      return;
+    }
+    setEditSubmitConfirmOpen(false);
+    setEditSubmitConfirmSyncRemote(true);
+    setPendingEditSubmitPayload(null);
+    setPendingEditChangedLabel("");
+    setPendingEditNeedRemote(false);
+  };
+
+  const handleConfirmEditSubmit = async () => {
+    if (!pendingEditSubmitPayload || submittingEdit) {
+      return;
+    }
+    const syncRemoteUpdate = pendingEditNeedRemote ? editSubmitConfirmSyncRemote : false;
     setSubmittingEdit(true);
     try {
-      await invokeCommand("submission_edit_submit", {
-        request: {
-          taskId: selectedTask.task.taskId,
-          task: {
-            title: taskForm.title,
-            description: taskForm.description || null,
-            partitionId: Number(taskForm.partitionId),
-            collectionId: taskForm.collectionId ? Number(taskForm.collectionId) : null,
-            tags: uniqueTags.join(","),
-            topicId: taskForm.activityTopicId ? Number(taskForm.activityTopicId) : null,
-            missionId: taskForm.activityMissionId ? Number(taskForm.activityMissionId) : null,
-            activityTitle: taskForm.activityTitle || null,
-            videoType: taskForm.videoType,
-            segmentPrefix: taskForm.segmentPrefix || null,
+      if (pendingEditSubmitPayload.needUpdateSource) {
+        await invokeCommand("submission_edit_update_sources", {
+          request: {
+            taskId: pendingEditSubmitPayload.taskId,
+            sourceVideos: pendingEditSubmitPayload.sourcePayload,
           },
-          segments: segmentPayload,
-        },
-      });
+        });
+      }
+      if (pendingEditSubmitPayload.needEditSubmit) {
+        await invokeCommand("submission_edit_submit", {
+          request: {
+            taskId: pendingEditSubmitPayload.taskId,
+            syncRemoteUpdate,
+            task: pendingEditSubmitPayload.task,
+            segments: pendingEditSubmitPayload.segments,
+          },
+        });
+      }
+      setEditSubmitConfirmOpen(false);
+      setEditSubmitConfirmSyncRemote(true);
+      setPendingEditSubmitPayload(null);
+      setPendingEditChangedLabel("");
+      setPendingEditNeedRemote(false);
       backToList();
       await loadTasks(statusFilter, currentPage, pageSize);
     } catch (error) {
@@ -2794,12 +3129,28 @@ export default function SubmissionSection() {
     }
   };
 
+  const parseRemoteState = (task) => {
+    const raw = task?.remoteState;
+    if (raw === null || raw === undefined) {
+      return null;
+    }
+    const text = String(raw).trim();
+    if (!text) {
+      return null;
+    }
+    const state = Number(text);
+    if (!Number.isFinite(state)) {
+      return null;
+    }
+    return state;
+  };
+
   const resolveRemoteStatus = (task) => {
     if (!task?.bvid) {
       return "进行中";
     }
-    const state = Number(task.remoteState);
-    if (!Number.isFinite(state)) {
+    const state = parseRemoteState(task);
+    if (state === null) {
       return "进行中";
     }
     if (state === -2) {
@@ -2818,12 +3169,18 @@ export default function SubmissionSection() {
   };
 
   const isRemoteRejected = (task) => {
-    const state = Number(task?.remoteState);
+    const state = parseRemoteState(task);
+    if (state === null) {
+      return false;
+    }
     return state === -2 || state === -4;
   };
 
   const isRemoteFailed = (task) => {
-    const state = Number(task?.remoteState);
+    const state = parseRemoteState(task);
+    if (state === null) {
+      return false;
+    }
     return state === -2 || state === -4;
   };
 
@@ -2955,10 +3312,14 @@ export default function SubmissionSection() {
     typeof selectedTask?.workflowConfig?.segmentationConfig?.enabled === "boolean"
       ? selectedTask.workflowConfig.segmentationConfig.enabled
       : Boolean(selectedTask?.outputSegments?.length);
-  const partitionLabel =
-    partitions.find((item) => String(item.tid) === String(taskForm.partitionId))?.name ||
-    taskForm.partitionId ||
-    "-";
+  const partitionLabel = (() => {
+    const exact = partitions.find((item) => String(item.tid) === String(taskForm.partitionId));
+    if (exact?.name) {
+      return exact.name;
+    }
+    const fallback = partitions.find((item) => String(item.tid) === String(taskForm.partitionId));
+    return fallback?.name || taskForm.partitionId || "-";
+  })();
   const collectionLabel =
     collections.find((item) => String(item.seasonId) === String(taskForm.collectionId))
       ?.name ||
@@ -2968,6 +3329,308 @@ export default function SubmissionSection() {
   const detailEstimatedSegments = segmentationEnabled
     ? Math.max(selectedTask?.outputSegments?.length || 0, estimatedSegments)
     : 0;
+  const hasPartitionOption = partitions.some((item) => {
+    return String(item.tid) === String(taskForm.partitionId);
+  });
+  const hasCollectionOption = collections.some(
+    (item) => String(item.seasonId) === String(taskForm.collectionId),
+  );
+  const partitionOptions =
+    isEditView && taskForm.partitionId && !hasPartitionOption
+      ? [
+          ...partitions,
+          {
+            tid: taskForm.partitionId,
+            name: `当前分区(${taskForm.partitionId})`,
+          },
+        ]
+      : partitions;
+  const partitionSelectValue = resolvePartitionSelectValue(
+    taskForm.partitionId,
+    partitionOptions,
+  );
+  const collectionOptions =
+    isEditView && taskForm.collectionId && !hasCollectionOption
+      ? [
+          ...collections,
+          {
+            seasonId: taskForm.collectionId,
+            name: `当前合集(${taskForm.collectionId})`,
+          },
+        ]
+      : collections;
+  const editChangedModules = isEditView
+    ? resolveEditChangedModules({
+        baseline: editBaseline,
+        taskForm,
+        tags,
+        tagInput,
+        sourceVideos,
+        editSegments,
+      })
+    : [];
+  const editModuleLabelMap = {
+    basic: "基本信息",
+    source: "源视频",
+    segments: "分段与上传",
+  };
+  const editChangedLabelText = editChangedModules
+    .map((key) => editModuleLabelMap[key] || key)
+    .join("、");
+  const formatActivityPlayCount = (value) => {
+    const count = Number(value || 0);
+    if (!Number.isFinite(count) || count <= 0) {
+      return "0";
+    }
+    if (count >= 100000000) {
+      return `${(count / 100000000).toFixed(1)}亿`;
+    }
+    if (count >= 10000) {
+      return `${(count / 10000).toFixed(1)}万`;
+    }
+    return String(Math.floor(count));
+  };
+  const selectedActivityOption = activitySelectOptions.find(
+    (item) => String(item.topicId) === String(taskForm.activityTopicId),
+  );
+  const activitySummaryText = selectedActivityOption
+    ? `播放次数：${formatActivityPlayCount(selectedActivityOption.readCount)}`
+    : "未参与活动";
+  const isActivityTag = (tag) => Boolean(taskForm.activityTitle) && tag === taskForm.activityTitle;
+  const resolveTagClassName = (tag) =>
+    isActivityTag(tag)
+      ? "inline-flex items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2 py-1 text-xs text-amber-700"
+      : "inline-flex items-center gap-1 rounded-full bg-[var(--accent)]/10 px-2 py-1 text-xs text-[var(--accent)]";
+  const resolveTagRemoveClassName = (tag) =>
+    isActivityTag(tag)
+      ? "text-[10px] font-semibold text-amber-700 hover:opacity-70"
+      : "text-[10px] font-semibold text-[var(--accent)] hover:opacity-70";
+  const renderActivityTopicSelector = () => (
+    <div className="mt-2 space-y-1">
+      <div className="text-xs text-[var(--muted)]">活动话题（可选）</div>
+      <div className="relative">
+        <input
+          value={activityKeyword}
+          onChange={(event) => {
+            setActivityKeyword(event.target.value);
+            setActivityDropdownOpen(true);
+          }}
+          onFocus={() => setActivityDropdownOpen(true)}
+          onBlur={() => {
+            window.setTimeout(() => {
+              setActivityDropdownOpen(false);
+            }, 120);
+          }}
+          placeholder="输入活动话题关键字并下拉选择"
+          disabled={!taskForm.partitionId}
+          className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm text-[var(--ink)] focus:border-[var(--accent)] focus:outline-none disabled:cursor-not-allowed disabled:bg-black/5"
+        />
+        {activityDropdownOpen && taskForm.partitionId ? (
+          <div className="absolute z-20 mt-1 max-h-64 w-full overflow-auto rounded-lg border border-black/10 bg-white/95 p-1 shadow-lg">
+            <button
+              type="button"
+              className={`w-full rounded-md px-3 py-2 text-left text-sm ${
+                taskForm.activityTopicId
+                  ? "text-[var(--ink)] hover:bg-black/5"
+                  : "bg-[var(--accent)]/10 text-[var(--accent)]"
+              }`}
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={() => handleActivitySelect("")}
+            >
+              不参与活动
+            </button>
+            {activityLoading ? (
+              <div className="px-3 py-2 text-xs text-[var(--muted)]">活动加载中...</div>
+            ) : null}
+            {activityFilteredOptions.map((activity) => {
+              const active = String(activity.topicId) === String(taskForm.activityTopicId);
+              return (
+                <button
+                  key={activity.topicId}
+                  type="button"
+                  className={`mt-1 w-full rounded-md px-3 py-2 text-left ${
+                    active
+                      ? "bg-[var(--accent)]/10 text-[var(--accent)]"
+                      : "text-[var(--ink)] hover:bg-black/5"
+                  }`}
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={() => handleActivitySelect(String(activity.topicId))}
+                >
+                  <div className="flex items-center gap-2">
+                    <div className="text-sm font-medium">{activity.name}</div>
+                    {activity.showActivityIcon ? (
+                      <span className="rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[10px] font-semibold text-emerald-700">
+                        活动
+                      </span>
+                    ) : null}
+                  </div>
+                  <div className="text-[11px] text-[var(--muted)]">
+                    播放 {formatActivityPlayCount(activity.readCount)}
+                    {activity.activityText ? ` · ${activity.activityText}` : ""}
+                  </div>
+                </button>
+              );
+            })}
+            {!activityLoading && !activityFilteredOptions.length ? (
+              <div className="px-3 py-2 text-xs text-[var(--muted)]">没有匹配的话题</div>
+            ) : null}
+          </div>
+        ) : null}
+      </div>
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          onClick={() =>
+            loadActivities(
+              taskForm.partitionId,
+              activityKeyword,
+            )
+          }
+          disabled={activityLoading || !taskForm.partitionId}
+          className="rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-xs text-[var(--muted)] hover:text-[var(--accent)] disabled:opacity-60"
+        >
+          刷新活动
+        </button>
+        {taskForm.activityTopicId ? (
+          <button
+            type="button"
+            onClick={() => handleActivitySelect("")}
+            className="rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-xs text-[var(--muted)] hover:text-[var(--accent)]"
+          >
+            清空选择
+          </button>
+        ) : null}
+      </div>
+      <div className="text-[11px] text-[var(--muted)]">{activitySummaryText}</div>
+      {activityLoading ? <div className="text-xs text-[var(--muted)]">活动加载中...</div> : null}
+      {activityMessage ? <div className="text-xs text-rose-500">{activityMessage}</div> : null}
+      {!activityLoading && !activityDropdownOpen && activityFilteredOptions.length === 0 && taskForm.partitionId ? (
+        <div className="text-xs text-[var(--muted)]">没有匹配的话题，请尝试更换关键字。</div>
+      ) : null}
+    </div>
+  );
+  const normalizeCoverPreviewSrc = (value) => {
+    const raw = String(value ?? "").trim();
+    if (!raw) {
+      return "";
+    }
+    if (raw.startsWith("//")) {
+      return `https:${raw}`;
+    }
+    if (raw.startsWith("http://")) {
+      return `https://${raw.slice("http://".length)}`;
+    }
+    return raw;
+  };
+  useEffect(() => {
+    let active = true;
+    const rawPath = String(taskForm.coverLocalPath || "").trim();
+    if (!rawPath) {
+      setLocalCoverDataPreviewSrc("");
+      return () => {
+        active = false;
+      };
+    }
+    const loadLocalCoverPreview = async () => {
+      try {
+        const data = await invokeCommand("submission_cover_local_preview", {
+          request: { filePath: rawPath },
+        });
+        if (!active) {
+          return;
+        }
+        setLocalCoverDataPreviewSrc(normalizeCoverPreviewSrc(data));
+      } catch (_) {
+        if (active) {
+          setLocalCoverDataPreviewSrc("");
+        }
+      }
+    };
+    loadLocalCoverPreview();
+    return () => {
+      active = false;
+    };
+  }, [taskForm.coverLocalPath]);
+  const localCoverFilePreviewSrc = taskForm.coverLocalPath
+    ? normalizeCoverPreviewSrc(convertFileSrc(taskForm.coverLocalPath))
+    : "";
+  const localCoverPreviewSrc = localCoverDataPreviewSrc || localCoverFilePreviewSrc;
+  const sessionCoverPreviewSrc = taskForm.coverDataUrl ? coverPreviewUrl : "";
+  const rawCoverPreviewSrc = normalizeCoverPreviewSrc(
+    sessionCoverPreviewSrc || localCoverPreviewSrc || taskForm.coverUrl,
+  );
+  useEffect(() => {
+    if (!coverPreviewModalOpen) {
+      return undefined;
+    }
+    const onKeyDown = (event) => {
+      if (event.key === "Escape") {
+        setCoverPreviewModalOpen(false);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [coverPreviewModalOpen]);
+  useEffect(() => {
+    let active = true;
+    const raw = String(rawCoverPreviewSrc || "").trim();
+    if (!raw) {
+      setCoverProxyPreviewSrc("");
+      return () => {
+        active = false;
+      };
+    }
+    if (!/^https?:\/\//i.test(raw)) {
+      setCoverProxyPreviewSrc("");
+      return () => {
+        active = false;
+      };
+    }
+    const cached = coverProxyCacheRef.current.get(raw);
+    if (cached) {
+      setCoverProxyPreviewSrc(cached);
+      return () => {
+        active = false;
+      };
+    }
+    setCoverProxyPreviewSrc("");
+    const loadCoverProxy = async () => {
+      try {
+        const data = await invokeCommand("video_proxy_image", { url: raw });
+        if (!active) {
+          return;
+        }
+        const normalized = normalizeCoverPreviewSrc(data);
+        if (!normalized) {
+          return;
+        }
+        coverProxyCacheRef.current.set(raw, normalized);
+        setCoverProxyPreviewSrc(normalized);
+      } catch (_) {
+        if (active) {
+          setCoverProxyPreviewSrc("");
+        }
+      }
+    };
+    loadCoverProxy();
+    return () => {
+      active = false;
+    };
+  }, [rawCoverPreviewSrc]);
+  const coverPreviewSrc = coverProxyPreviewSrc || rawCoverPreviewSrc;
+  const openCoverPreviewModal = (src) => {
+    const normalized = normalizeCoverPreviewSrc(src);
+    if (!normalized) {
+      return;
+    }
+    setCoverPreviewModalSrc(normalized);
+    setCoverPreviewModalOpen(true);
+  };
+  const closeCoverPreviewModal = () => {
+    setCoverPreviewModalOpen(false);
+  };
 
   const totalPages = Math.max(1, Math.ceil(totalTasks / pageSize));
   const quickFillTotalPages = Math.max(1, Math.ceil(quickFillTotal / quickFillPageSize));
@@ -3035,24 +3698,63 @@ export default function SubmissionSection() {
                   rows={2}
                   readOnly={isReadOnly}
                   className="w-full rounded-xl border border-black/10 bg-white/80 px-3 py-2 text-sm text-[var(--ink)] focus:border-[var(--accent)] focus:outline-none"
-                />
-              </div>
-          <div className="grid gap-2 lg:grid-cols-3">
+	                />
+	              </div>
+	              <div className="space-y-2">
+	                <div className="text-xs text-[var(--muted)]">视频封面（本地裁剪上传）</div>
+	                <div className="flex flex-wrap items-center gap-3">
+	                  <div className="h-[120px] w-[192px] overflow-hidden rounded-lg border border-black/10 bg-black/5">
+	                    {coverPreviewSrc ? (
+	                      <img
+	                        src={coverPreviewSrc}
+	                        alt="封面预览"
+	                        className="h-full w-full object-cover"
+	                      />
+	                    ) : (
+	                      <div className="flex h-full items-center justify-center text-xs text-[var(--muted)]">
+	                        暂无封面
+	                      </div>
+	                    )}
+	                  </div>
+	                  <div className="flex flex-wrap gap-2">
+	                    <button
+	                      type="button"
+	                      className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
+	                      onClick={handleSelectCoverFile}
+	                    >
+	                      选择封面
+	                    </button>
+	                    <button
+	                      type="button"
+	                      className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)] disabled:opacity-60"
+	                      onClick={handleClearCover}
+	                      disabled={!coverPreviewSrc}
+	                    >
+	                      清空封面
+	                    </button>
+	                  </div>
+	                </div>
+	                <div className="text-xs text-[var(--muted)]">
+	                  裁剪比例固定 16:10，建议最小尺寸 960x600
+	                </div>
+	              </div>
+	          <div className="grid gap-2 lg:grid-cols-3">
             <div className="space-y-1">
               <div className="text-xs text-[var(--muted)]">
                 B站分区<span className="ml-1 text-rose-500">必填</span>
               </div>
               <select
-                value={taskForm.partitionId}
-                onChange={(event) =>
-                  setTaskForm((prev) => ({ ...prev, partitionId: event.target.value }))
-                }
+                value={partitionSelectValue}
+                onChange={(event) => handlePartitionChange(event.target.value)}
                 disabled={isReadOnly}
                 className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
               >
                 <option value="">请选择分区</option>
-                {partitions.map((partition) => (
-                  <option key={partition.tid} value={partition.tid}>
+                {partitionOptions.map((partition) => (
+                  <option
+                    key={partition.tid}
+                    value={buildPartitionOptionValue(partition)}
+                  >
                     {partition.name}
                   </option>
                 ))}
@@ -3069,7 +3771,7 @@ export default function SubmissionSection() {
                 className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
               >
                 <option value="">请选择合集</option>
-                {collections.map((collection) => (
+                {collectionOptions.map((collection) => (
                   <option key={collection.seasonId} value={collection.seasonId}>
                     {collection.name}
                   </option>
@@ -3103,12 +3805,12 @@ export default function SubmissionSection() {
                   {tags.map((tag) => (
                     <span
                       key={tag}
-                      className="inline-flex items-center gap-1 rounded-full bg-[var(--accent)]/10 px-2 py-1 text-xs text-[var(--accent)]"
+                      className={resolveTagClassName(tag)}
                     >
-                      {tag}
+                      {isActivityTag(tag) ? `#话题 ${tag}` : tag}
                       {!isReadOnly ? (
                         <button
-                          className="text-[10px] font-semibold text-[var(--accent)] hover:opacity-70"
+                          className={resolveTagRemoveClassName(tag)}
                           onClick={() => removeTag(tag)}
                           title="删除标签"
                         >
@@ -3128,41 +3830,7 @@ export default function SubmissionSection() {
                   )}
                 </div>
               </div>
-              <div className="mt-2 space-y-1">
-                <div className="text-xs text-[var(--muted)]">活动话题（可选）</div>
-                <div className="flex flex-wrap items-center gap-2">
-                  <select
-                    value={taskForm.activityTopicId}
-                    onChange={handleActivityChange}
-                    disabled={isReadOnly || activityLoading || !taskForm.partitionId}
-                    className="min-w-[200px] flex-1 rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
-                  >
-                    <option value="">不参与活动</option>
-                    {activitySelectOptions.map((activity) => (
-                      <option key={activity.topicId} value={activity.topicId}>
-                        {activity.name}
-                        {activity.activityText ? ` · ${activity.activityText}` : ""}
-                      </option>
-                    ))}
-                  </select>
-                  {isReadOnly ? null : (
-                    <button
-                      type="button"
-                      onClick={() => loadActivities(taskForm.partitionId)}
-                      disabled={activityLoading || !taskForm.partitionId}
-                      className="rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-xs text-[var(--muted)] hover:text-[var(--accent)] disabled:opacity-60"
-                    >
-                      刷新活动
-                    </button>
-                  )}
-                </div>
-                {activityLoading ? (
-                  <div className="text-xs text-[var(--muted)]">活动加载中...</div>
-                ) : null}
-                {activityMessage ? (
-                  <div className="text-xs text-rose-500">{activityMessage}</div>
-                ) : null}
-              </div>
+              {isReadOnly ? null : renderActivityTopicSelector()}
             </div>
             <div className="space-y-1">
               <div className="text-xs text-[var(--muted)]">分段前缀（可选）</div>
@@ -4694,8 +5362,7 @@ export default function SubmissionSection() {
               { key: "basic", label: "基本信息" },
               { key: "source", label: "源视频" },
               { key: "merged", label: "合并视频" },
-              { key: "segments", label: "输出分段" },
-              { key: "upload", label: "上传进度" },
+              { key: "segmentUpload", label: "分段与上传" },
             ].map((tab) => (
               <button
                 key={tab.key}
@@ -4748,23 +5415,59 @@ export default function SubmissionSection() {
                         className="w-full rounded-xl border border-black/10 bg-white/80 px-3 py-2 text-sm text-[var(--ink)] focus:border-[var(--accent)] focus:outline-none"
                       />
                     </div>
+                    <div className="space-y-2">
+                      <div className="text-xs text-[var(--muted)]">视频封面（本地裁剪上传）</div>
+                      <div className="flex flex-wrap items-center gap-3">
+                        <div className="h-[120px] w-[192px] overflow-hidden rounded-lg border border-black/10 bg-black/5">
+                          {coverPreviewSrc ? (
+                            <img
+                              src={coverPreviewSrc}
+                              alt="封面预览"
+                              className="h-full w-full object-cover"
+                            />
+                          ) : (
+                            <div className="flex h-full items-center justify-center text-xs text-[var(--muted)]">
+                              暂无封面
+                            </div>
+                          )}
+                        </div>
+                        <div className="flex flex-wrap gap-2">
+                          <button
+                            type="button"
+                            className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)]"
+                            onClick={handleSelectCoverFile}
+                          >
+                            选择封面
+                          </button>
+                          <button
+                            type="button"
+                            className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)] disabled:opacity-60"
+                            onClick={handleClearCover}
+                            disabled={!coverPreviewSrc}
+                          >
+                            清空封面
+                          </button>
+                        </div>
+                      </div>
+                      <div className="text-xs text-[var(--muted)]">
+                        裁剪比例固定 16:10，建议最小尺寸 960x600
+                      </div>
+                    </div>
                     <div className="grid gap-3 lg:grid-cols-2">
                       <div className="space-y-1">
                         <div className="text-xs text-[var(--muted)]">B站分区</div>
                         <select
-                          value={taskForm.partitionId}
-                          onChange={(event) =>
-                            setTaskForm((prev) => ({
-                              ...prev,
-                              partitionId: event.target.value,
-                            }))
-                          }
+                          value={partitionSelectValue}
+                          onChange={(event) => handlePartitionChange(event.target.value)}
                           disabled={isEditView}
                           className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none disabled:cursor-not-allowed disabled:bg-black/5"
                         >
                           <option value="">请选择分区</option>
-                          {partitions.map((partition) => (
-                            <option key={partition.tid} value={partition.tid}>
+                          {partitionOptions.map((partition) => (
+                            <option
+                              key={partition.tid}
+                              value={buildPartitionOptionValue(partition)}
+                            >
                               {partition.name}
                             </option>
                           ))}
@@ -4783,7 +5486,7 @@ export default function SubmissionSection() {
                           className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
                         >
                           <option value="">请选择合集</option>
-                          {collections.map((collection) => (
+                          {collectionOptions.map((collection) => (
                             <option key={collection.seasonId} value={collection.seasonId}>
                               {collection.name}
                             </option>
@@ -4830,11 +5533,11 @@ export default function SubmissionSection() {
                           {tags.map((tag) => (
                             <span
                               key={tag}
-                              className="inline-flex items-center gap-1 rounded-full bg-[var(--accent)]/10 px-2 py-1 text-xs text-[var(--accent)]"
+                              className={resolveTagClassName(tag)}
                             >
-                              {tag}
+                              {isActivityTag(tag) ? `#话题 ${tag}` : tag}
                               <button
-                                className="text-[10px] font-semibold text-[var(--accent)] hover:opacity-70"
+                                className={resolveTagRemoveClassName(tag)}
                                 onClick={() => removeTag(tag)}
                                 title="删除标签"
                               >
@@ -4852,6 +5555,7 @@ export default function SubmissionSection() {
                         </div>
                       </div>
                     </div>
+                    {renderActivityTopicSelector()}
                   </div>
                 </div>
               ) : (
@@ -4870,6 +5574,27 @@ export default function SubmissionSection() {
                       <div className="text-xs text-[var(--muted)]">视频描述</div>
                       <div className="rounded-lg border border-black/10 bg-white/80 px-3 py-2">
                         {taskForm.description || "-"}
+                      </div>
+                    </div>
+                    <div className="space-y-1">
+                      <div className="text-xs text-[var(--muted)]">视频封面</div>
+                      <div className="rounded-lg border border-black/10 bg-white/80 p-2">
+                        {coverPreviewSrc ? (
+                          <button
+                            type="button"
+                            className="h-[120px] w-[192px] overflow-hidden rounded-md border border-black/10 bg-black/5"
+                            onClick={() => openCoverPreviewModal(coverPreviewSrc)}
+                            title="点击查看大图"
+                          >
+                            <img
+                              src={coverPreviewSrc}
+                              alt="封面预览"
+                              className="h-full w-full object-cover"
+                            />
+                          </button>
+                        ) : (
+                          <span className="text-[var(--muted)]">-</span>
+                        )}
                       </div>
                     </div>
                     <div className="grid gap-3 lg:grid-cols-2">
@@ -4908,9 +5633,9 @@ export default function SubmissionSection() {
                             {tags.map((tag) => (
                               <span
                                 key={tag}
-                                className="rounded-full bg-[var(--accent)]/10 px-2 py-1 text-xs text-[var(--accent)]"
+                                className={resolveTagClassName(tag)}
                               >
-                                {tag}
+                                {isActivityTag(tag) ? `#话题 ${tag}` : tag}
                               </span>
                             ))}
                           </div>
@@ -4952,40 +5677,124 @@ export default function SubmissionSection() {
           ) : null}
           {detailTab === "source" ? (
             <div className="mt-4 overflow-hidden rounded-xl border border-black/5">
-              <table className="w-full text-left text-sm">
-                <thead className="bg-black/5 text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
-                  <tr>
-                    <th className="px-4 py-2">序号</th>
-                    <th className="px-4 py-2">视频文件路径</th>
-                    <th className="px-4 py-2">开始时间</th>
-                    <th className="px-4 py-2">结束时间</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {selectedTask.sourceVideos.length === 0 ? (
+              {isEditView ? (
+                <div className="w-full">
+                  <div className="flex flex-wrap items-center justify-between gap-3 border-b border-black/5 px-4 py-3">
+                    <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+                      源视频配置
+                    </div>
+                    <button
+                      className="rounded-full bg-[var(--accent)] px-3 py-1 text-xs font-semibold text-white"
+                      onClick={addSource}
+                    >
+                      添加视频
+                    </button>
+                  </div>
+                  <table className="w-full text-left text-sm">
+                    <thead className="bg-black/5 text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
+                      <tr>
+                        <th className="px-4 py-2">序号</th>
+                        <th className="px-4 py-2">视频文件路径</th>
+                        <th className="px-4 py-2">开始时间</th>
+                        <th className="px-4 py-2">结束时间</th>
+                        <th className="px-4 py-2">操作</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {sourceVideos.length === 0 ? (
+                        <tr>
+                          <td className="px-4 py-3 text-[var(--muted)]" colSpan={5}>
+                            暂无源视频
+                          </td>
+                        </tr>
+                      ) : (
+                        sourceVideos.map((item, index) => (
+                          <tr key={`edit-source-${index}`} className="border-t border-black/5">
+                            <td className="px-4 py-2 text-[var(--muted)]">{index + 1}</td>
+                            <td className="px-4 py-2">
+                              <div className="flex flex-wrap gap-2">
+                                <input
+                                  value={item.sourceFilePath}
+                                  onChange={(event) =>
+                                    updateSource(index, "sourceFilePath", event.target.value)
+                                  }
+                                  placeholder="请输入视频文件路径（必填）"
+                                  className="w-full flex-1 rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+                                />
+                                <button
+                                  className="rounded-lg border border-black/10 bg-white px-3 py-2 text-xs font-semibold text-[var(--ink)]"
+                                  onClick={() => openFileDialog(index)}
+                                >
+                                  选择
+                                </button>
+                              </div>
+                            </td>
+                            <td className="px-4 py-2">
+                              <input
+                                value={item.startTime}
+                                onChange={(event) =>
+                                  updateSourceTime(index, "startTime", event.target.value)
+                                }
+                                onBlur={() => normalizeSourceTime(index, "startTime")}
+                                placeholder="00:00:00"
+                                className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+                              />
+                            </td>
+                            <td className="px-4 py-2">
+                              <input
+                                value={item.endTime}
+                                onChange={(event) =>
+                                  updateSourceTime(index, "endTime", event.target.value)
+                                }
+                                onBlur={() => normalizeSourceTime(index, "endTime")}
+                                placeholder="00:00:00"
+                                className="w-full rounded-lg border border-black/10 bg-white/80 px-3 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+                              />
+                            </td>
+                            <td className="px-4 py-2">
+                              <button
+                                className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                                onClick={() => removeSource(index)}
+                              >
+                                删除
+                              </button>
+                            </td>
+                          </tr>
+                        ))
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <table className="w-full text-left text-sm">
+                  <thead className="bg-black/5 text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
                     <tr>
-                      <td className="px-4 py-3 text-[var(--muted)]" colSpan={4}>
-                        暂无源视频
-                      </td>
+                      <th className="px-4 py-2">序号</th>
+                      <th className="px-4 py-2">视频文件路径</th>
+                      <th className="px-4 py-2">开始时间</th>
+                      <th className="px-4 py-2">结束时间</th>
                     </tr>
-                  ) : (
-                    selectedTask.sourceVideos.map((item, index) => (
-                      <tr key={item.id} className="border-t border-black/5">
-                        <td className="px-4 py-2 text-[var(--muted)]">{index + 1}</td>
-                        <td className="px-4 py-2 text-[var(--ink)]">
-                          {item.sourceFilePath}
-                        </td>
-                        <td className="px-4 py-2 text-[var(--muted)]">
-                          {item.startTime || "-"}
-                        </td>
-                        <td className="px-4 py-2 text-[var(--muted)]">
-                          {item.endTime || "-"}
+                  </thead>
+                  <tbody>
+                    {selectedTask.sourceVideos.length === 0 ? (
+                      <tr>
+                        <td className="px-4 py-3 text-[var(--muted)]" colSpan={4}>
+                          暂无源视频
                         </td>
                       </tr>
-                    ))
-                  )}
-                </tbody>
-              </table>
+                    ) : (
+                      selectedTask.sourceVideos.map((item, index) => (
+                        <tr key={item.id} className="border-t border-black/5">
+                          <td className="px-4 py-2 text-[var(--muted)]">{index + 1}</td>
+                          <td className="px-4 py-2 text-[var(--ink)]">{item.sourceFilePath}</td>
+                          <td className="px-4 py-2 text-[var(--muted)]">{item.startTime || "-"}</td>
+                          <td className="px-4 py-2 text-[var(--muted)]">{item.endTime || "-"}</td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              )}
             </div>
           ) : null}
           {detailTab === "merged" ? (
@@ -5059,45 +5868,7 @@ export default function SubmissionSection() {
               </table>
             </div>
           ) : null}
-          {detailTab === "segments" ? (
-            <div className="mt-4 overflow-hidden rounded-xl border border-black/5">
-              <table className="w-full text-left text-sm">
-                <thead className="bg-black/5 text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
-                  <tr>
-                    <th className="px-4 py-2">序号</th>
-                    <th className="px-4 py-2">P名称</th>
-                    <th className="px-4 py-2">文件路径</th>
-                    <th className="px-4 py-2">上传状态</th>
-                    <th className="px-4 py-2">CID</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {selectedTask.outputSegments.length === 0 ? (
-                    <tr>
-                      <td className="px-4 py-3 text-[var(--muted)]" colSpan={5}>
-                        暂无输出分段
-                      </td>
-                    </tr>
-                  ) : (
-                    selectedTask.outputSegments.map((item, index) => (
-                      <tr key={item.segmentId} className="border-t border-black/5">
-                        <td className="px-4 py-2 text-[var(--muted)]">{index + 1}</td>
-                        <td className="px-4 py-2 text-[var(--ink)]">{item.partName}</td>
-                        <td className="px-4 py-2 text-[var(--muted)]">
-                          {item.segmentFilePath}
-                        </td>
-                        <td className="px-4 py-2 text-[var(--muted)]">
-                          {formatSegmentUploadStatus(item.uploadStatus)}
-                        </td>
-                        <td className="px-4 py-2 text-[var(--muted)]">{item.cid || "-"}</td>
-                      </tr>
-                    ))
-                  )}
-                </tbody>
-              </table>
-            </div>
-          ) : null}
-          {detailTab === "upload" ? (
+          {detailTab === "segmentUpload" ? (
             <div className="mt-4 overflow-hidden rounded-xl border border-black/5">
               {isEditView ? (
                 <div className="w-full">
@@ -5347,17 +6118,106 @@ export default function SubmissionSection() {
           ) : null}
           {isEditView ? (
             <div className="mt-4 flex flex-wrap gap-2">
+              <div className="w-full text-xs text-[var(--muted)]">
+                本次修改：{editChangedLabelText || "无"}
+              </div>
               <button
                 className="rounded-full bg-[var(--accent)] px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
                 onClick={handleEditSubmit}
-                disabled={submittingEdit}
+                disabled={submittingEdit || coverUploading}
               >
-                {submittingEdit ? "提交中" : "提交修改"}
+                {submittingEdit ? "提交中" : coverUploading ? "封面上传中" : "提交修改"}
               </button>
             </div>
           ) : null}
         </div>
       ) : null}
+      {coverPreviewModalOpen ? (
+        <div
+          className="fixed inset-0 z-[70] flex items-center justify-center bg-black/70 px-4 py-6"
+          onClick={closeCoverPreviewModal}
+        >
+          <div
+            className="relative max-h-full max-w-[96vw]"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <button
+              type="button"
+              className="absolute right-2 top-2 rounded-full border border-white/20 bg-black/40 px-3 py-1 text-xs font-semibold text-white"
+              onClick={closeCoverPreviewModal}
+            >
+              关闭
+            </button>
+            <img
+              src={coverPreviewModalSrc}
+              alt="封面大图"
+              className="max-h-[90vh] max-w-[96vw] rounded-lg object-contain shadow-2xl"
+            />
+          </div>
+        </div>
+      ) : null}
+      {editSubmitConfirmOpen ? (
+        <div className="fixed inset-0 z-[65] flex items-center justify-center bg-black/30 px-4">
+          <div className="w-full max-w-md rounded-2xl bg-white p-5 shadow-lg">
+            <div className="text-sm font-semibold text-[var(--ink)]">确认提交修改</div>
+            <div className="mt-2 text-xs text-[var(--muted)]">
+              本次将提交：{pendingEditChangedLabel || "无"}。
+            </div>
+            {pendingEditNeedRemote ? (
+              <label className="mt-4 flex items-start gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  checked={editSubmitConfirmSyncRemote}
+                  onChange={(event) => setEditSubmitConfirmSyncRemote(event.target.checked)}
+                  disabled={submittingEdit}
+                />
+                <div>
+                  <div className="font-semibold text-[var(--ink)]">是否同步更新远程</div>
+                  <div className="text-xs text-[var(--muted)]">
+                    {editSubmitConfirmSyncRemote
+                      ? "勾选后将同步调用B站远程编辑接口。"
+                      : "不勾选时仅更新本地数据，后续重投稿/重分段时再同步。"}
+                  </div>
+                </div>
+              </label>
+            ) : (
+              <div className="mt-4 rounded-lg border border-black/10 bg-black/5 px-3 py-2 text-xs text-[var(--muted)]">
+                本次仅更新源视频配置，只会保存本地数据。
+              </div>
+            )}
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                className="rounded-full border border-black/10 bg-white px-3 py-1 text-xs font-semibold text-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-60"
+                type="button"
+                onClick={handleCloseEditSubmitConfirm}
+                disabled={submittingEdit}
+              >
+                取消
+              </button>
+              <button
+                className="rounded-full bg-[var(--accent)] px-3 py-1 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
+                type="button"
+                onClick={handleConfirmEditSubmit}
+                disabled={submittingEdit}
+              >
+                {submittingEdit ? "提交中" : "确认提交"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      <CoverCropModal
+        open={coverCropOpen}
+        imageSrc={coverCropSourceUrl}
+        aspectRatio={coverAspectRatio}
+        minWidth={coverMinWidth}
+        minHeight={coverMinHeight}
+        submitting={coverUploading}
+        onClose={handleCloseCoverCrop}
+        onImageLoadError={handleCoverCropImageError}
+        onConfirm={handleConfirmCoverCrop}
+      />
       <BaiduSyncPathPicker
         open={syncPickerOpen}
         value={resolveSyncPath(syncTarget)}

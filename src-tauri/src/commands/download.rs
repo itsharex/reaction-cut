@@ -1000,6 +1000,7 @@ async fn handle_integration_download(
   );
   let mut submission = request.submission_request;
   let workflow_config = request.workflow_config.clone();
+  let local_path_prefix = load_local_path_prefix(context.db.as_ref());
   let normalized_baidu_sync_filename =
     crate::commands::submission::normalize_baidu_sync_filename(
       submission.baidu_sync_filename.as_deref(),
@@ -1085,7 +1086,8 @@ async fn handle_integration_download(
 
     for (index, part) in submission.video_parts.into_iter().enumerate() {
       let part_id = uuid::Uuid::new_v4().to_string();
-      let stored_file_path = to_stored_local_path(context.db.as_ref(), &part.file_path);
+      let stored_file_path =
+        to_stored_local_path_with_prefix(local_path_prefix.as_path(), &part.file_path);
       conn.execute(
         "INSERT INTO task_source_video (id, task_id, source_file_path, sort_order, start_time, end_time) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",

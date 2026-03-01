@@ -120,6 +120,46 @@ impl BilibiliClient {
     parse_response(&response)
   }
 
+  pub async fn post_form(
+    &self,
+    url: &str,
+    params: &[(String, String)],
+    form: &[(String, String)],
+    auth: Option<&AuthInfo>,
+  ) -> Result<Value, String> {
+    let full_url = if params.is_empty() {
+      url.to_string()
+    } else {
+      format!("{}?{}", url, build_query(params))
+    };
+
+    let mut headers = default_headers();
+    if let Some(auth) = auth {
+      headers.insert(
+        "Cookie",
+        HeaderValue::from_str(&auth.cookie).map_err(|_| "Invalid cookie header".to_string())?,
+      );
+    }
+    if url.contains("live.bilibili.com") {
+      headers.insert(REFERER, HeaderValue::from_static("https://live.bilibili.com/"));
+      headers.insert("Origin", HeaderValue::from_static("https://live.bilibili.com"));
+    }
+
+    let response = self
+      .client
+      .post(full_url)
+      .headers(headers)
+      .form(form)
+      .send()
+      .await
+      .map_err(|err| format!("Request failed: {}", err))?
+      .text()
+      .await
+      .map_err(|err| format!("Failed to read response: {}", err))?;
+
+    parse_response(&response)
+  }
+
   pub fn cached_buvid3(&self) -> Option<String> {
     self
       .buvid3

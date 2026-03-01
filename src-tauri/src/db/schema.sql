@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS submission_task (
   title TEXT NOT NULL,
   description TEXT,
   cover_url TEXT,
+  cover_local_path TEXT,
   partition_id INTEGER NOT NULL,
   tags TEXT,
   topic_id INTEGER,

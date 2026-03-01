@@ -214,6 +214,33 @@ export default function DownloadSection() {
   const hasVideo = videoItems.length > 0;
   const hasSelection = selectedCount > 0;
   const isMultiVideo = videoItems.length > 1;
+  const buildPartitionOptionValue = (partition) => {
+    const tid = String(partition?.tid ?? "").trim();
+    if (!tid) {
+      return "";
+    }
+    return tid;
+  };
+  const parsePartitionOptionValue = (value) => {
+    return String(value || "").trim();
+  };
+  const resolvePartitionSelectValue = (partitionId, options = partitions) => {
+    const normalizedId = String(partitionId || "").trim();
+    if (!normalizedId) {
+      return "";
+    }
+    return options.some((item) => String(item.tid) === normalizedId) ? normalizedId : normalizedId;
+  };
+  const handlePartitionChange = (rawValue) => {
+    const partitionId = parsePartitionOptionValue(rawValue);
+    setSubmissionConfig((prev) => ({
+      ...prev,
+      partitionId,
+    }));
+  };
+  const partitionSelectValue = resolvePartitionSelectValue(
+    submissionConfig.partitionId,
+  );
   const activitySelectOptions = (() => {
     const currentId = Number(submissionConfig.activityTopicId || 0);
     if (!currentId) {
@@ -231,6 +258,7 @@ export default function DownloadSection() {
         description: "",
         activityText: "",
         activityDescription: "",
+        showActivityIcon: false,
       },
       ...activityOptions,
     ];
@@ -346,7 +374,11 @@ export default function DownloadSection() {
       return;
     }
     loadActivities(partitionId);
-  }, [integrationEnabled, submissionConfig.partitionId]);
+  }, [
+    integrationEnabled,
+    submissionConfig.partitionId,
+    partitions,
+  ]);
 
   useEffect(() => {
     if (!quickFillOpen) {
@@ -402,7 +434,10 @@ export default function DownloadSection() {
           if (prev.partitionId) {
             return prev;
           }
-          return { ...prev, partitionId: String(data[0].tid) };
+          return {
+            ...prev,
+            partitionId: String(data[0].tid),
+          };
         });
       }
     } catch (error) {
@@ -726,6 +761,9 @@ export default function DownloadSection() {
         description: item?.description || "",
         activityText: item?.activityText || item?.activity_text || "",
         activityDescription: item?.activityDescription || item?.activity_description || "",
+        showActivityIcon: Boolean(
+          item?.showActivityIcon ?? item?.show_activity_icon ?? false,
+        ),
       }))
       .filter((item) => item.topicId > 0 && item.name);
   };
@@ -1755,18 +1793,16 @@ export default function DownloadSection() {
                     </div>
                     <div className="grid gap-2 lg:grid-cols-3">
                       <select
-                        value={submissionConfig.partitionId}
-                        onChange={(event) =>
-                          setSubmissionConfig((prev) => ({
-                            ...prev,
-                            partitionId: event.target.value,
-                          }))
-                        }
+                        value={partitionSelectValue}
+                        onChange={(event) => handlePartitionChange(event.target.value)}
                         className="w-full"
                       >
                         <option value="">B站分区</option>
                         {partitions.map((partition) => (
-                          <option key={partition.tid} value={partition.tid}>
+                          <option
+                            key={partition.tid}
+                            value={buildPartitionOptionValue(partition)}
+                          >
                             {partition.name}
                           </option>
                         ))}
@@ -1844,6 +1880,7 @@ export default function DownloadSection() {
                             <option value="">不参与活动</option>
                             {activitySelectOptions.map((activity) => (
                               <option key={activity.topicId} value={activity.topicId}>
+                                {activity.showActivityIcon ? "【活动】" : ""}
                                 {activity.name}
                                 {activity.activityText ? ` · ${activity.activityText}` : ""}
                               </option>
@@ -1851,7 +1888,11 @@ export default function DownloadSection() {
                           </select>
                           <button
                             type="button"
-                            onClick={() => loadActivities(submissionConfig.partitionId)}
+                            onClick={() =>
+                              loadActivities(
+                                submissionConfig.partitionId,
+                              )
+                            }
                             disabled={activityLoading || !submissionConfig.partitionId}
                             className="rounded-lg border border-[var(--split-color)] bg-white/70 px-3 py-2 text-xs text-[var(--desc-color)] hover:text-[var(--primary-color)] disabled:opacity-60"
                           >
