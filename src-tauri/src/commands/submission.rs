@@ -802,7 +802,7 @@ pub async fn submission_create(
       normalize_baidu_sync_filename(request.task.baidu_sync_filename.as_deref());
     conn.execute(
       "INSERT INTO submission_task (task_id, status, priority, title, description, cover_url, cover_local_path, partition_id, tags, topic_id, mission_id, activity_title, video_type, collection_id, bvid, aid, created_at, updated_at, bilibili_uid, baidu_uid, segment_prefix, baidu_sync_enabled, baidu_sync_path, baidu_sync_filename) \
-       VALUES (?1, 'PENDING', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, NULL, NULL, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+       VALUES (?1, 'PENDING', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, NULL, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
       params![
         &task_id,
         if request.task.priority.unwrap_or(false) { 1 } else { 0 },
