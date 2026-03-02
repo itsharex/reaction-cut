@@ -894,7 +894,7 @@ pub async fn submission_create(
     let context_clone = context.clone();
     let task_id_clone = task_id.clone();
     tauri::async_runtime::spawn(async move {
-      let _ = run_submission_workflow(context_clone, task_id_clone).await;
+      run_submission_workflow_guarded(context_clone, task_id_clone).await;
     });
   }
 
@@ -8226,13 +8226,20 @@ struct SourceReadyInfo {
 
 fn format_timecode_seconds(seconds: f64) -> String {
   let total = if seconds.is_finite() { seconds.max(0.0) } else { 0.0 };
-  let hours = (total / 3600.0).floor() as i64;
-  let minutes = ((total - (hours as f64 * 3600.0)) / 60.0).floor() as i64;
-  let secs = total - (hours as f64 * 3600.0) - (minutes as f64 * 60.0);
-  if secs.fract().abs() < 0.001 {
-    format!("{:02}:{:02}:{:02}", hours, minutes, secs.floor() as i64)
+  let total_millis = if total >= (i64::MAX as f64 / 1000.0) {
+    i64::MAX
   } else {
-    format!("{:02}:{:02}:{:06.3}", hours, minutes, secs)
+    (total * 1000.0).round() as i64
+  };
+
+  let hours = total_millis / 3_600_000;
+  let minutes = (total_millis % 3_600_000) / 60_000;
+  let secs = (total_millis % 60_000) / 1000;
+  let millis = total_millis % 1000;
+  if millis == 0 {
+    format!("{:02}:{:02}:{:02}", hours, minutes, secs)
+  } else {
+    format!("{:02}:{:02}:{:02}.{:03}", hours, minutes, secs, millis)
   }
 }
 
@@ -8782,6 +8789,24 @@ async fn run_submission_workflow(
   Ok(())
 }
 
+async fn run_submission_workflow_guarded(context: SubmissionContext, task_id: String) {
+  if let Err(err) = run_submission_workflow(context.clone(), task_id.clone()).await {
+    if err == "Workflow cancelled" {
+      append_log(
+        &context.app_log_path,
+        &format!("submission_workflow_cancelled task_id={} err={}", task_id, err),
+      );
+      return;
+    }
+    let _ = update_workflow_status(&context, &task_id, "FAILED", None, 0.0);
+    let _ = update_submission_status(&context, &task_id, "FAILED");
+    append_log(
+      &context.app_log_path,
+      &format!("submission_workflow_failed task_id={} err={}", task_id, err),
+    );
+  }
+}
+
 pub fn start_submission_workflow(
   db: Arc<Db>,
   app_log_path: Arc<PathBuf>,
@@ -8796,7 +8821,7 @@ pub fn start_submission_workflow(
     local_path_prefix,
   };
   tauri::async_runtime::spawn(async move {
-    let _ = run_submission_workflow(context, task_id).await;
+    run_submission_workflow_guarded(context, task_id).await;
   });
 }
 
@@ -9960,7 +9985,7 @@ async fn recover_submission_tasks(context: SubmissionQueueContext) {
       &format!("submission_recover_workflow task_id={}", task_id),
     );
     tauri::async_runtime::spawn(async move {
-      let _ = run_submission_workflow(context_clone, task_id_clone).await;
+      run_submission_workflow_guarded(context_clone, task_id_clone).await;
     });
   }
 }
@@ -14614,5 +14639,11 @@ mod tests {
     }];
     let result = validate_source_video_inputs(&sources);
     assert_eq!(result.unwrap_err(), "第1行时间范围不合法");
+  }
+
+  #[test]
+  fn format_timecode_seconds_handles_rounding_carry() {
+    assert_eq!(format_timecode_seconds(7199.999667), "02:00:00");
+    assert_eq!(format_timecode_seconds(59.9996), "00:01:00");
   }
 }
