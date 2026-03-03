@@ -215,10 +215,7 @@ function App() {
       </aside>
       <div id="main" className="main-shell">
         <div className="title-bar" data-tauri-drag-region>
-          <div className="flex items-center gap-3 text-[var(--content-color)]">
-            <span className="text-sm font-semibold">Reaction Cut</span>
-            <span className="text-xs text-[var(--desc-color)]">{activeLabel}</span>
-          </div>
+          <div />
           <button
             className={`avatar-btn ${active === "auth" ? "active" : ""}`}
             onClick={() => setActive("auth")}

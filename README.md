@@ -1,7 +1,7 @@
 <div align="center">
-  <img src="src-tauri/icons/icon.png" width="240" alt="reaction-cut-rust logo" />
+  <img src="src-tauri/icons/icon.png" width="240" alt="biliClipFlow logo" />
 
-  <h1>reaction-cut-rust</h1>
+  <h1>biliClipFlow</h1>
   <p>面向 Bilibili 录播的下载、剪辑、分段、投稿一体化桌面工具</p>
 
   <!-- 徽章占位，可按需替换为真实仓库链接 -->
@@ -18,7 +18,7 @@
 
 ## 项目描述
 
-reaction-cut-rust 是一个基于 Tauri 的跨平台桌面应用，聚焦 Bilibili 录播场景：
+biliClipFlow 是一个基于 Tauri 的跨平台桌面应用，聚焦 Bilibili 录播场景：
 
 - 录播订阅与自动录制
 - 多分 P 下载

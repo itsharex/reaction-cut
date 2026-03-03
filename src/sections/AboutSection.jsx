@@ -114,10 +114,10 @@ export default function AboutSection() {
           <div className="flex items-center gap-3">
             <img
               src={appLogo}
-              alt="Reaction Cut Logo"
+              alt="biliClipFlow Logo"
               className="h-32 w-32 rounded-xl border border-black/10 bg-white object-cover"
             />
-            <div className="text-lg font-semibold text-[var(--content-color)]">Reaction Cut</div>
+            <div className="text-lg font-semibold text-[var(--content-color)]">biliClipFlow</div>
           </div>
           <div className="desc leading-loose">
             介绍：支持直播间订阅与手动/自动录制（含弹幕录制配置），支持视频下载（分P选择、多视频、下载+投稿），提供投稿任务的剪辑/合并/分段/更新与重试管理，并内置 FLV 转 MP4 转封装工具。

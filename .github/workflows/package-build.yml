@@ -103,7 +103,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: "reaction-cut-rust-${{ matrix.os }}-${{ runner.arch }}"
+          name: "biliClipFlow-${{ matrix.os }}-${{ runner.arch }}"
           path: |
             src-tauri/target/release/bundle/nsis/*.exe
             src-tauri/target/release/bundle/msi/*.msi
@@ -140,8 +140,8 @@ jobs:
             exit 1
           fi
           mkdir -p dist/release-zips
-          windows_dirs=(dist/reaction-cut-rust-windows-latest-*)
-          macos_dirs=(dist/reaction-cut-rust-macos-latest-*)
+          windows_dirs=(dist/biliClipFlow-windows-latest-*)
+          macos_dirs=(dist/biliClipFlow-macos-latest-*)
           if [ ! -d "${windows_dirs[0]}" ]; then
             echo "missing windows artifacts"
             exit 1
@@ -153,12 +153,12 @@ jobs:
           for dir in "${windows_dirs[@]}"; do
             arch="${dir##*-}"
             arch_lower="$(echo "$arch" | tr '[:upper:]' '[:lower:]')"
-            zip -r "dist/release-zips/reaction-cut-rust-${RELEASE_TAG}-windows-${arch_lower}.zip" "$dir"
+            zip -r "dist/release-zips/biliClipFlow-${RELEASE_TAG}-windows-${arch_lower}.zip" "$dir"
           done
           for dir in "${macos_dirs[@]}"; do
             arch="${dir##*-}"
             arch_lower="$(echo "$arch" | tr '[:upper:]' '[:lower:]')"
-            zip -r "dist/release-zips/reaction-cut-rust-${RELEASE_TAG}-macos-${arch_lower}.zip" "$dir"
+            zip -r "dist/release-zips/biliClipFlow-${RELEASE_TAG}-macos-${arch_lower}.zip" "$dir"
           done
 
       - name: Publish release (auto notes)

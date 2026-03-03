@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "reaction-cut-rust",
+  "productName": "biliClipFlow",
   "version": "1.0.0",
   "identifier": "com.tbw.reaction-cut-rust",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "reaction-cut-rust",
+        "title": "biliClipFlow",
         "width": 800,
         "height": 600
       }
