@@ -1,7 +1,20 @@
 import { useEffect, useState } from "react";
-import { open } from "@tauri-apps/plugin-dialog";
+import { confirm as dialogConfirm, message as dialogMessage, open } from "@tauri-apps/plugin-dialog";
 import { invokeCommand } from "../lib/tauri";
 import BaiduSyncPathPicker from "../components/BaiduSyncPathPicker";
+
+const SETTINGS_TABS = [
+  { key: "download", title: "下载设置", group: "设置" },
+  { key: "sync", title: "同步配置", group: "同步" },
+  { key: "live", title: "直播录制", group: "直播录制" },
+  { key: "cache", title: "缓存", group: "存储" },
+];
+
+const CACHE_ITEMS = [
+  { key: "log", title: "日志", description: "包含 auth_debug.log、app_debug.log 等运行日志。" },
+  { key: "temp", title: "临时文件", description: "下载与处理过程中产生的临时文件目录。" },
+  { key: "database", title: "数据库文件", description: "应用数据库文件体积（清理会执行压缩 VACUUM）。" },
+];
 
 export default function SettingsSection() {
   const [threads, setThreads] = useState(3);
@@ -20,6 +33,11 @@ export default function SettingsSection() {
   const [syncConfigMessage, setSyncConfigMessage] = useState("");
   const [syncPickerOpen, setSyncPickerOpen] = useState(false);
   const [liveMessage, setLiveMessage] = useState("");
+  const [activeTab, setActiveTab] = useState("download");
+  const [cacheItems, setCacheItems] = useState([]);
+  const [cacheMessage, setCacheMessage] = useState("");
+  const [cacheLoading, setCacheLoading] = useState(false);
+  const [cacheClearingKey, setCacheClearingKey] = useState("");
   const [liveSettings, setLiveSettings] = useState({
     fileNameTemplate: "live/{{ roomId }}/{{ liveDate }}/录制-{{ roomId }}-{{ now }}-{{ title }}.flv",
     recordPath: "",
@@ -86,6 +104,7 @@ export default function SettingsSection() {
         const maxParallel = Math.min(100, Math.max(1, Number(data.baiduMaxParallel || 3)));
         setBaiduMaxParallel(maxParallel);
         await logClient(`settings_load:ok:${data.downloadPath || ""}`);
+        await loadCacheOverview();
       }
     } catch (error) {
       await logClient(`settings_load:error:${error?.message || "unknown"}`);
@@ -136,6 +155,64 @@ export default function SettingsSection() {
 
   const handleSyncPathChange = (path) => {
     setSyncTargetPath(path);
+  };
+
+  const formatBytes = (value) => {
+    const size = Number(value);
+    if (!Number.isFinite(size) || size <= 0) {
+      return "0 B";
+    }
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    const exponent = Math.min(units.length - 1, Math.floor(Math.log(size) / Math.log(1024)));
+    const normalized = size / 1024 ** exponent;
+    return `${normalized.toFixed(normalized >= 10 || exponent === 0 ? 0 : 1)} ${units[exponent]}`;
+  };
+
+  const loadCacheOverview = async () => {
+    setCacheMessage("");
+    setCacheLoading(true);
+    try {
+      const data = await invokeCommand("settings_cache_overview");
+      setCacheItems(Array.isArray(data) ? data : []);
+    } catch (error) {
+      setCacheMessage(error?.message || "加载缓存信息失败");
+    } finally {
+      setCacheLoading(false);
+    }
+  };
+
+  const handleClearCache = async (key) => {
+    const target = CACHE_ITEMS.find((item) => item.key === key);
+    const title = target?.title || key;
+    const confirmed = await dialogConfirm(`确认清理「${title}」吗？`, {
+      title: "清理缓存",
+      kind: key === "database" ? "warning" : "info",
+      okLabel: "清理",
+      cancelLabel: "取消",
+    });
+    if (!confirmed) {
+      return;
+    }
+    setCacheMessage("");
+    setCacheClearingKey(key);
+    try {
+      await invokeCommand("settings_cache_clear", { key });
+      await loadCacheOverview();
+      await dialogMessage(`「${title}」已清理完成。`, { title: "清理缓存" });
+    } catch (error) {
+      setCacheMessage(error?.message || "清理缓存失败");
+    } finally {
+      setCacheClearingKey("");
+    }
+  };
+
+  const handleOpenCache = async (key) => {
+    setCacheMessage("");
+    try {
+      await invokeCommand("settings_cache_open", { key });
+    } catch (error) {
+      setCacheMessage(error?.message || "打开缓存目录失败");
+    }
   };
 
   useEffect(() => {
@@ -275,6 +352,7 @@ export default function SettingsSection() {
         await logClient(`settings_save:ok:${data.downloadPath || ""}`);
       }
       setMessage("设置已保存，日志目录需重启生效");
+      await loadCacheOverview();
     } catch (error) {
       await logClient(`settings_save:error:${error?.message || "unknown"}`);
       setMessage(error.message);
@@ -341,8 +419,24 @@ export default function SettingsSection() {
 
 
   return (
-    <div className="space-y-6">
-      <div className="rounded-2xl bg-[var(--surface)]/90 p-6 shadow-sm ring-1 ring-black/5">
+    <div className="space-y-4">
+      <div className="flex flex-wrap gap-2 xl:hidden">
+        {SETTINGS_TABS.map((tab) => (
+          <button
+            key={tab.key}
+            className={`tab-btn ${activeTab === tab.key ? "active" : ""}`}
+            onClick={() => setActiveTab(tab.key)}
+            type="button"
+          >
+            {tab.title}
+          </button>
+        ))}
+      </div>
+      <div className="flex min-h-0 gap-4">
+        <div className="flex-1 min-w-0 space-y-6">
+      <div
+        className={`${activeTab === "download" ? "block" : "hidden"} rounded-2xl bg-[var(--surface)]/90 p-6 shadow-sm ring-1 ring-black/5`}
+      >
         <div>
           <p className="text-sm uppercase tracking-[0.2em] text-[var(--muted)]">设置</p>
           <h2 className="text-2xl font-semibold text-[var(--ink)]">下载设置</h2>
@@ -513,7 +607,9 @@ export default function SettingsSection() {
         ) : null}
       </div>
 
-      <div className="rounded-2xl bg-[var(--surface)]/90 p-6 shadow-sm ring-1 ring-black/5">
+      <div
+        className={`${activeTab === "sync" ? "block" : "hidden"} rounded-2xl bg-[var(--surface)]/90 p-6 shadow-sm ring-1 ring-black/5`}
+      >
         <div>
           <p className="text-sm uppercase tracking-[0.2em] text-[var(--muted)]">同步</p>
           <h2 className="text-2xl font-semibold text-[var(--ink)]">同步配置</h2>
@@ -569,7 +665,9 @@ export default function SettingsSection() {
         ) : null}
       </div>
 
-      <div className="rounded-2xl bg-[var(--surface)]/90 p-6 shadow-sm ring-1 ring-black/5">
+      <div
+        className={`${activeTab === "live" ? "block" : "hidden"} rounded-2xl bg-[var(--surface)]/90 p-6 shadow-sm ring-1 ring-black/5`}
+      >
         <div>
           <p className="text-sm uppercase tracking-[0.2em] text-[var(--muted)]">直播录制</p>
           <h2 className="text-2xl font-semibold text-[var(--ink)]">基础设置</h2>
@@ -709,7 +807,9 @@ export default function SettingsSection() {
         </div>
       </div>
 
-      <div className="rounded-2xl bg-[var(--surface)]/90 p-6 shadow-sm ring-1 ring-black/5">
+      <div
+        className={`${activeTab === "live" ? "block" : "hidden"} rounded-2xl bg-[var(--surface)]/90 p-6 shadow-sm ring-1 ring-black/5`}
+      >
         <div>
           <p className="text-sm uppercase tracking-[0.2em] text-[var(--muted)]">直播录制</p>
           <h2 className="text-2xl font-semibold text-[var(--ink)]">分段与修复</h2>
@@ -834,7 +934,9 @@ export default function SettingsSection() {
         </div>
       </div>
 
-      <div className="rounded-2xl bg-[var(--surface)]/90 p-6 shadow-sm ring-1 ring-black/5">
+      <div
+        className={`${activeTab === "live" ? "block" : "hidden"} rounded-2xl bg-[var(--surface)]/90 p-6 shadow-sm ring-1 ring-black/5`}
+      >
         <div>
           <p className="text-sm uppercase tracking-[0.2em] text-[var(--muted)]">直播录制</p>
           <h2 className="text-2xl font-semibold text-[var(--ink)]">弹幕录制</h2>
@@ -928,7 +1030,9 @@ export default function SettingsSection() {
         </div>
       </div>
 
-      <div className="rounded-2xl bg-[var(--surface)]/90 p-6 shadow-sm ring-1 ring-black/5">
+      <div
+        className={`${activeTab === "live" ? "block" : "hidden"} rounded-2xl bg-[var(--surface)]/90 p-6 shadow-sm ring-1 ring-black/5`}
+      >
         <div>
           <p className="text-sm uppercase tracking-[0.2em] text-[var(--muted)]">直播录制</p>
           <h2 className="text-2xl font-semibold text-[var(--ink)]">重连与检测</h2>
@@ -1034,6 +1138,91 @@ export default function SettingsSection() {
             {liveMessage}
           </div>
         ) : null}
+      </div>
+
+      <div
+        className={`${activeTab === "cache" ? "block" : "hidden"} rounded-2xl bg-[var(--surface)]/90 p-6 shadow-sm ring-1 ring-black/5`}
+      >
+        <div>
+          <p className="text-sm uppercase tracking-[0.2em] text-[var(--muted)]">存储</p>
+          <h2 className="text-2xl font-semibold text-[var(--ink)]">缓存</h2>
+          <p className="mt-2 text-sm text-[var(--muted)]">
+            展示日志、临时文件和数据库文件体积，可按项清理。
+          </p>
+        </div>
+        <div className="mt-4 space-y-3">
+          {CACHE_ITEMS.map((item) => {
+            const cache = cacheItems.find((entry) => entry?.key === item.key);
+            const path = String(cache?.path || "").trim() || "-";
+            return (
+              <div
+                key={item.key}
+                className="rounded-xl border border-black/10 bg-white/70 p-3"
+              >
+                <div className="flex flex-wrap items-start justify-between gap-2">
+                  <div>
+                    <div className="text-sm font-semibold text-[var(--ink)]">{item.title}</div>
+                    <div className="mt-1 text-xs text-[var(--muted)]">{item.description}</div>
+                    <div className="mt-2 break-all text-xs text-[var(--muted)]">{path}</div>
+                  </div>
+                  <div className="flex flex-col items-end gap-2">
+                    <div className="text-sm font-semibold text-[var(--ink)]">
+                      {formatBytes(cache?.sizeBytes || 0)}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        className="rounded-full border border-black/10 bg-white px-3 py-1.5 text-xs font-semibold text-[var(--ink)] transition hover:border-black/20"
+                        onClick={() => handleOpenCache(item.key)}
+                        type="button"
+                      >
+                        打开
+                      </button>
+                      <button
+                        className="rounded-full border border-black/10 bg-white px-3 py-1.5 text-xs font-semibold text-[var(--ink)] transition hover:border-black/20 disabled:opacity-60"
+                        onClick={() => handleClearCache(item.key)}
+                        disabled={cacheLoading || cacheClearingKey === item.key}
+                        type="button"
+                      >
+                        {cacheClearingKey === item.key ? "清理中..." : "清理"}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        <div className="mt-4 flex flex-wrap gap-2">
+          <button
+            className="rounded-full border border-black/10 bg-white px-4 py-2 text-sm font-semibold text-[var(--ink)] transition hover:border-black/20 disabled:opacity-60"
+            onClick={loadCacheOverview}
+            disabled={cacheLoading}
+            type="button"
+          >
+            {cacheLoading ? "刷新中..." : "刷新"}
+          </button>
+        </div>
+        {cacheMessage ? (
+          <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700">
+            {cacheMessage}
+          </div>
+        ) : null}
+      </div>
+        </div>
+        <div className="tab hidden xl:flex">
+          {SETTINGS_TABS.map((tab) => (
+            <button
+              key={tab.key}
+              className={activeTab === tab.key ? "active" : ""}
+              onClick={() => setActiveTab(tab.key)}
+              type="button"
+            >
+              <span>{tab.title}</span>
+              <small className="text-[10px] text-[var(--muted)]">{tab.group}</small>
+              <label />
+            </button>
+          ))}
+        </div>
       </div>
 
       <BaiduSyncPathPicker

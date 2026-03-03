@@ -1,12 +1,15 @@
 use chrono::Utc;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
+use tauri::Manager;
 use tauri::State;
 
 use crate::api::ApiResponse;
 use crate::config::default_download_dir;
 use crate::db::Db;
 use crate::AppState;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 pub const DEFAULT_THREADS: i64 = 3;
 pub const DEFAULT_QUEUE_SIZE: i64 = 10;
@@ -26,6 +29,9 @@ pub const LEGACY_LIVE_FILE_TEMPLATE_DATE: &str =
   "live/{{ roomId }}/{{ date }}/录制-{{ roomId }}-{{ now }}-{{ title }}.flv";
 pub const DEFAULT_LIVE_FILE_TEMPLATE: &str =
   "live/{{ roomId }}/{{ liveDate }}/录制-{{ roomId }}-{{ now }}-{{ title }}.flv";
+pub const CACHE_KEY_LOG: &str = "log";
+pub const CACHE_KEY_TEMP: &str = "temp";
+pub const CACHE_KEY_DATABASE: &str = "database";
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -75,6 +81,15 @@ pub struct LiveSettings {
   pub baidu_sync_path: String,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheItemInfo {
+  pub key: String,
+  pub path: String,
+  pub size_bytes: u64,
+  pub exists: bool,
+}
+
 #[tauri::command]
 pub fn get_download_settings(state: State<'_, AppState>) -> ApiResponse<DownloadSettings> {
   match load_download_settings_from_db(&state.db) {
@@ -88,6 +103,55 @@ pub fn get_live_settings(state: State<'_, AppState>) -> ApiResponse<LiveSettings
   match load_live_settings_from_db(&state.db) {
     Ok(settings) => ApiResponse::success(settings),
     Err(err) => ApiResponse::error(format!("Failed to load live settings: {}", err)),
+  }
+}
+
+#[tauri::command]
+pub fn settings_cache_overview(
+  state: State<'_, AppState>,
+  app: tauri::AppHandle,
+) -> ApiResponse<Vec<CacheItemInfo>> {
+  match build_cache_overview(state.inner(), &app) {
+    Ok(items) => ApiResponse::success(items),
+    Err(err) => ApiResponse::error(err),
+  }
+}
+
+#[tauri::command]
+pub fn settings_cache_clear(
+  state: State<'_, AppState>,
+  app: tauri::AppHandle,
+  key: String,
+) -> ApiResponse<String> {
+  let normalized = key.trim().to_lowercase();
+  let result = match normalized.as_str() {
+    CACHE_KEY_DATABASE => compact_database_cache(state.inner(), &app),
+    _ => resolve_cache_path_by_key(state.inner(), &app, &normalized)
+      .and_then(|path| clear_path_children(path.as_path())),
+  };
+  match result {
+    Ok(()) => ApiResponse::success("清理完成".to_string()),
+    Err(err) => ApiResponse::error(err),
+  }
+}
+
+#[tauri::command]
+pub fn settings_cache_open(
+  state: State<'_, AppState>,
+  app: tauri::AppHandle,
+  key: String,
+) -> ApiResponse<String> {
+  let normalized = key.trim().to_lowercase();
+  let result = resolve_cache_path_by_key(state.inner(), &app, &normalized).and_then(|path| {
+    if !path.exists() {
+      return Err(format!("缓存路径不存在: {}", path.to_string_lossy()));
+    }
+    tauri_plugin_opener::open_path(path, None::<&str>)
+      .map_err(|err| format!("打开缓存路径失败: {}", err))
+  });
+  match result {
+    Ok(()) => ApiResponse::success("已打开".to_string()),
+    Err(err) => ApiResponse::error(err),
   }
 }
 
@@ -559,4 +623,135 @@ pub fn default_live_settings() -> LiveSettings {
     baidu_sync_enabled: false,
     baidu_sync_path: "/录播".to_string(),
   }
+}
+
+fn build_cache_overview(state: &AppState, app: &tauri::AppHandle) -> Result<Vec<CacheItemInfo>, String> {
+  let mut items = Vec::with_capacity(3);
+
+  let log_path = resolve_log_dir_for_cache(state)?;
+  items.push(build_cache_item(CACHE_KEY_LOG, log_path.as_path()));
+
+  let temp_path = resolve_temp_dir_for_cache(state)?;
+  items.push(build_cache_item(CACHE_KEY_TEMP, temp_path.as_path()));
+
+  let database_path = resolve_database_path(app)?;
+  items.push(build_cache_item(CACHE_KEY_DATABASE, database_path.as_path()));
+
+  Ok(items)
+}
+
+fn resolve_cache_path_by_key(
+  state: &AppState,
+  app: &tauri::AppHandle,
+  key: &str,
+) -> Result<PathBuf, String> {
+  match key {
+    CACHE_KEY_LOG => resolve_log_dir_for_cache(state),
+    CACHE_KEY_TEMP => resolve_temp_dir_for_cache(state),
+    CACHE_KEY_DATABASE => resolve_database_path(app),
+    _ => Err(format!("不支持的缓存类型: {}", key)),
+  }
+}
+
+fn build_cache_item(key: &str, path: &Path) -> CacheItemInfo {
+  let exists = path.exists();
+  CacheItemInfo {
+    key: key.to_string(),
+    path: path.to_string_lossy().to_string(),
+    size_bytes: calculate_path_size(path),
+    exists,
+  }
+}
+
+fn resolve_log_dir_for_cache(state: &AppState) -> Result<PathBuf, String> {
+  load_download_settings_from_db(&state.db)
+    .map(|settings| PathBuf::from(settings.log_dir))
+    .map_err(|err| format!("读取日志目录失败: {}", err))
+}
+
+fn resolve_temp_dir_for_cache(state: &AppState) -> Result<PathBuf, String> {
+  load_download_settings_from_db(&state.db)
+    .map(|settings| PathBuf::from(settings.download_path).join("temp"))
+    .map_err(|err| format!("读取临时目录失败: {}", err))
+}
+
+fn resolve_database_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+  app
+    .path()
+    .app_data_dir()
+    .map(|path| path.join("reaction-cut-rust.sqlite3"))
+    .map_err(|err| format!("解析数据库路径失败: {}", err))
+}
+
+fn calculate_path_size(path: &Path) -> u64 {
+  if !path.exists() {
+    return 0;
+  }
+  if path.is_file() {
+    return fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+  }
+  let mut total = 0u64;
+  let mut stack = vec![path.to_path_buf()];
+  while let Some(current) = stack.pop() {
+    let Ok(entries) = fs::read_dir(current) else {
+      continue;
+    };
+    for entry in entries.flatten() {
+      let entry_path = entry.path();
+      let Ok(meta) = entry.metadata() else {
+        continue;
+      };
+      if meta.is_file() {
+        total = total.saturating_add(meta.len());
+      } else if meta.is_dir() {
+        stack.push(entry_path);
+      }
+    }
+  }
+  total
+}
+
+fn clear_path_children(path: &Path) -> Result<(), String> {
+  if !path.exists() {
+    return Ok(());
+  }
+  if path.is_file() {
+    return fs::remove_file(path).map_err(|err| format!("清理文件失败: {}", err));
+  }
+  let entries = fs::read_dir(path).map_err(|err| format!("读取缓存目录失败: {}", err))?;
+  for entry in entries {
+    let entry = entry.map_err(|err| format!("读取缓存项失败: {}", err))?;
+    let entry_path = entry.path();
+    let meta = entry
+      .metadata()
+      .map_err(|err| format!("读取缓存项元数据失败: {}", err))?;
+    if meta.is_dir() {
+      fs::remove_dir_all(&entry_path)
+        .map_err(|err| format!("删除缓存目录失败: {}", err))?;
+    } else {
+      fs::remove_file(&entry_path).map_err(|err| format!("删除缓存文件失败: {}", err))?;
+    }
+  }
+  Ok(())
+}
+
+fn compact_database_cache(state: &AppState, app: &tauri::AppHandle) -> Result<(), String> {
+  state
+    .db
+    .with_conn(|conn| {
+      conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
+      Ok(())
+    })
+    .map_err(|err| format!("压缩数据库失败: {}", err))?;
+
+  let db_path = resolve_database_path(app)?;
+  let db_wal = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
+  let db_shm = PathBuf::from(format!("{}-shm", db_path.to_string_lossy()));
+  if db_wal.exists() {
+    let _ = fs::remove_file(db_wal);
+  }
+  if db_shm.exists() {
+    let _ = fs::remove_file(db_shm);
+  }
+  Ok(())
 }

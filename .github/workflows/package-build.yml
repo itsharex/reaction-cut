@@ -63,6 +63,20 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Sync app version from release tag
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+        run: |
+          $rawTag = "${{ inputs.release_tag }}".Trim()
+          if ([string]::IsNullOrWhiteSpace($rawTag)) {
+            throw "release_tag is empty"
+          }
+          $version = $rawTag -replace '^[vV]', ''
+          if ([string]::IsNullOrWhiteSpace($version)) {
+            throw "invalid release_tag: $rawTag"
+          }
+          pnpm run version:bump -- $version
+          Write-Host "Version synced from tag: $rawTag -> $version"
+
       - name: Install WiX
         if: matrix.os == 'windows-latest'
         run: choco install -y wixtoolset

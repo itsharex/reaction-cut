@@ -445,6 +445,7 @@ pub struct WorkflowStatusRecord {
   pub status: String,
   pub current_step: Option<String>,
   pub progress: f64,
+  pub error_message: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -7680,7 +7681,7 @@ fn load_tasks(
         (Some(_), Some(_)) => format!(
           "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
-                  wi.status, wi.current_step, wi.progress \
+                  wi.status, wi.current_step, wi.progress, wi.error_message \
            FROM submission_task st \
            LEFT JOIN workflow_instances wi ON wi.task_id = st.task_id \
            WHERE st.bilibili_uid = ?1 AND st.status = ?2 AND (st.title LIKE ?3 COLLATE NOCASE OR st.bvid LIKE ?3 COLLATE NOCASE) {} LIMIT ?4 OFFSET ?5",
@@ -7689,7 +7690,7 @@ fn load_tasks(
         (Some(_), None) => format!(
           "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
-                  wi.status, wi.current_step, wi.progress \
+                  wi.status, wi.current_step, wi.progress, wi.error_message \
            FROM submission_task st \
            LEFT JOIN workflow_instances wi ON wi.task_id = st.task_id \
            WHERE st.bilibili_uid = ?1 AND st.status = ?2 {} LIMIT ?3 OFFSET ?4",
@@ -7698,7 +7699,7 @@ fn load_tasks(
         (None, Some(_)) => format!(
           "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
-                  wi.status, wi.current_step, wi.progress \
+                  wi.status, wi.current_step, wi.progress, wi.error_message \
            FROM submission_task st \
            LEFT JOIN workflow_instances wi ON wi.task_id = st.task_id \
            WHERE st.bilibili_uid = ?1 AND (st.title LIKE ?2 COLLATE NOCASE OR st.bvid LIKE ?2 COLLATE NOCASE) {} LIMIT ?3 OFFSET ?4",
@@ -7707,7 +7708,7 @@ fn load_tasks(
         (None, None) => format!(
           "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
                   CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
-                  wi.status, wi.current_step, wi.progress \
+                  wi.status, wi.current_step, wi.progress, wi.error_message \
            FROM submission_task st \
            LEFT JOIN workflow_instances wi ON wi.task_id = st.task_id \
            WHERE st.bilibili_uid = ?1 {} LIMIT ?2 OFFSET ?3",
@@ -7745,10 +7746,12 @@ fn map_submission_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<SubmissionTa
   let workflow_status = row.get::<_, Option<String>>(25)?;
   let workflow_step = row.get::<_, Option<String>>(26)?;
   let workflow_progress: Option<f64> = row.get(27)?;
+  let workflow_error_message: Option<String> = row.get(28)?;
   let workflow_status = workflow_status.map(|status| WorkflowStatusRecord {
     status,
     current_step: workflow_step,
     progress: workflow_progress.unwrap_or(0.0),
+    error_message: workflow_error_message,
   });
 
   Ok(SubmissionTaskRecord {
@@ -7792,7 +7795,7 @@ fn load_task_detail(
       let task = conn.query_row(
         "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
                 CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
-                wi.status, wi.current_step, wi.progress \
+                wi.status, wi.current_step, wi.progress, wi.error_message \
          FROM submission_task st \
          LEFT JOIN workflow_instances wi ON wi.task_id = st.task_id \
          WHERE st.task_id = ?1",
@@ -8944,6 +8947,9 @@ const UPLOAD_SEGMENT_RETRY_LIMIT: u32 = 3;
 const SUBMISSION_QUEUE_RETRY_LIMIT: u32 = 3;
 const SUBMISSION_QUEUE_RETRY_BASE_DELAY_SECS: u64 = 10;
 const SUBMISSION_QUEUE_RETRY_MAX_DELAY_SECS: u64 = 120;
+const COLLECTION_BIND_RETRY_LIMIT: u32 = 3;
+const COLLECTION_BIND_RETRY_BASE_DELAY_SECS: u64 = 5;
+const COLLECTION_BIND_RETRY_MAX_DELAY_SECS: u64 = 30;
 const REMOTE_AUDIT_STATUS_REVIEWING: &str = "is_pubing";
 const REMOTE_AUDIT_STATUS_REJECTED: &str = "not_pubed";
 const REMOTE_AUDIT_STATUS_SCOPE: &str = "is_pubing|not_pubed";
@@ -9001,6 +9007,14 @@ fn submission_queue_retry_delay_secs(attempt: u32) -> u64 {
   let multiplier = 1u64 << exponent.min(10);
   let wait = SUBMISSION_QUEUE_RETRY_BASE_DELAY_SECS.saturating_mul(multiplier);
   wait.min(SUBMISSION_QUEUE_RETRY_MAX_DELAY_SECS)
+}
+
+fn collection_bind_retry_delay_secs(attempt: u32) -> u64 {
+  let safe_attempt = attempt.max(1);
+  let exponent = safe_attempt.saturating_sub(1);
+  let multiplier = 1u64 << exponent.min(5);
+  let wait = COLLECTION_BIND_RETRY_BASE_DELAY_SECS.saturating_mul(multiplier);
+  wait.min(COLLECTION_BIND_RETRY_MAX_DELAY_SECS)
 }
 
 fn preupload_parse_retry_delay_secs(attempt: u32) -> u64 {
@@ -9149,7 +9163,7 @@ async fn run_submission_upload(
   let mut auth = match load_auth_or_refresh(&context, "submission_upload").await {
     Ok(auth) => auth,
     Err(err) => {
-      update_submission_status(&submission_context, &task_id, "FAILED")?;
+      update_submission_status_with_reason(&submission_context, &task_id, "FAILED", Some(&err))?;
       return Err(err);
     }
   };
@@ -9159,7 +9173,7 @@ async fn run_submission_upload(
       auth = match refresh_auth(&context, "submission_upload_csrf").await {
         Ok(auth) => auth,
         Err(err) => {
-          update_submission_status(&submission_context, &task_id, "FAILED")?;
+          update_submission_status_with_reason(&submission_context, &task_id, "FAILED", Some(&err))?;
           return Err(err);
         }
       };
@@ -9173,14 +9187,24 @@ async fn run_submission_upload(
   let detail = load_task_detail(&submission_context, &task_id)?;
   let tags = detail.task.tags.clone().unwrap_or_default();
   if tags.trim().is_empty() {
-    update_submission_status(&submission_context, &task_id, "FAILED")?;
+    update_submission_status_with_reason(
+      &submission_context,
+      &task_id,
+      "FAILED",
+      Some("投稿标签不能为空"),
+    )?;
     return Err("投稿标签不能为空".to_string());
   }
   let workflow_type = load_latest_workflow_type(&submission_context, &task_id)?
     .unwrap_or_else(|| "VIDEO_SUBMISSION".to_string());
   let integrate_current_bvid = load_integrate_current_bvid(detail.workflow_config.as_ref());
   if integrate_current_bvid && detail.task.bvid.as_deref().unwrap_or("").trim().is_empty() {
-    update_submission_status(&submission_context, &task_id, "FAILED")?;
+    update_submission_status_with_reason(
+      &submission_context,
+      &task_id,
+      "FAILED",
+      Some("当前任务暂无BVID，无法集成投稿"),
+    )?;
     return Err("当前任务暂无BVID，无法集成投稿".to_string());
   }
   let is_update_workflow = workflow_type == "VIDEO_UPDATE" || integrate_current_bvid;
@@ -9198,7 +9222,7 @@ async fn run_submission_upload(
         }
       }
       Err(err) => {
-        update_submission_status(&submission_context, &task_id, "FAILED")?;
+        update_submission_status_with_reason(&submission_context, &task_id, "FAILED", Some(&err))?;
         return Err(err);
       }
     }
@@ -9216,14 +9240,24 @@ async fn run_submission_upload(
 
   if is_update_workflow || settings.enable_segmentation {
     if detail.output_segments.is_empty() {
-      update_submission_status(&submission_context, &task_id, "FAILED")?;
+      update_submission_status_with_reason(
+        &submission_context,
+        &task_id,
+        "FAILED",
+        Some("未找到分段文件"),
+      )?;
       return Err("未找到分段文件".to_string());
     }
     let mut preupload_retry_round: u32 = 0;
     loop {
       let detail = load_task_detail(&submission_context, &task_id)?;
       if detail.output_segments.is_empty() {
-        update_submission_status(&submission_context, &task_id, "FAILED")?;
+        update_submission_status_with_reason(
+          &submission_context,
+          &task_id,
+          "FAILED",
+          Some("未找到分段文件"),
+        )?;
         return Err("未找到分段文件".to_string());
       }
       let failed_count = detail
@@ -9232,7 +9266,12 @@ async fn run_submission_upload(
         .filter(|segment| segment.upload_status == "FAILED")
         .count();
       if failed_count > 0 {
-        update_submission_status(&submission_context, &task_id, "FAILED")?;
+        update_submission_status_with_reason(
+          &submission_context,
+          &task_id,
+          "FAILED",
+          Some("存在分段上传失败，请重试失败分P"),
+        )?;
         return Err("存在分段上传失败，请重试失败分P".to_string());
       }
       let pending: Vec<(usize, String)> = detail
@@ -9249,7 +9288,7 @@ async fn run_submission_upload(
             break;
           }
           Err(err) => {
-            update_submission_status(&submission_context, &task_id, "FAILED")?;
+            update_submission_status_with_reason(&submission_context, &task_id, "FAILED", Some(&err))?;
             return Err(err);
           }
         }
@@ -9332,13 +9371,23 @@ async fn run_submission_upload(
       if has_other_error {
         let error_message = last_error
           .unwrap_or_else(|| "存在分段上传失败，请重试失败分P".to_string());
-        update_submission_status(&submission_context, &task_id, "FAILED")?;
+        update_submission_status_with_reason(
+          &submission_context,
+          &task_id,
+          "FAILED",
+          Some(&error_message),
+        )?;
         return Err(error_message);
       }
       if has_preupload_parse_error {
         preupload_retry_round = preupload_retry_round.saturating_add(1);
         if preupload_retry_round > PREUPLOAD_PARSE_RETRY_LIMIT {
-          update_submission_status(&submission_context, &task_id, "FAILED")?;
+          update_submission_status_with_reason(
+            &submission_context,
+            &task_id,
+            "FAILED",
+            Some("预上传解析失败重试次数已达上限"),
+          )?;
           return Err("预上传解析失败重试次数已达上限".to_string());
         }
         let wait_secs = preupload_parse_retry_delay_secs(preupload_retry_round);
@@ -9357,12 +9406,22 @@ async fn run_submission_upload(
   } else {
     let merged = load_latest_merged_video(&submission_context, &task_id)?;
     let Some(merged) = merged else {
-      update_submission_status(&submission_context, &task_id, "FAILED")?;
+      update_submission_status_with_reason(
+        &submission_context,
+        &task_id,
+        "FAILED",
+        Some("未找到合并视频"),
+      )?;
       return Err("未找到合并视频".to_string());
     };
     let merged_path = merged.video_path.as_deref().unwrap_or("").to_string();
     if merged_path.trim().is_empty() {
-      update_submission_status(&submission_context, &task_id, "FAILED")?;
+      update_submission_status_with_reason(
+        &submission_context,
+        &task_id,
+        "FAILED",
+        Some("合并视频路径为空"),
+      )?;
       return Err("合并视频路径为空".to_string());
     }
     let target = UploadTarget::Merged(merged.id);
@@ -9409,12 +9468,22 @@ async fn run_submission_upload(
   }
 
   if parts.is_empty() {
-    update_submission_status(&submission_context, &task_id, "FAILED")?;
+    update_submission_status_with_reason(
+      &submission_context,
+      &task_id,
+      "FAILED",
+      Some("投稿文件为空"),
+    )?;
     return Err("投稿文件为空".to_string());
   }
 
   if !is_update_workflow && parts.len() > MAX_PARTS_PER_BVID {
-    update_submission_status(&submission_context, &task_id, "FAILED")?;
+    update_submission_status_with_reason(
+      &submission_context,
+      &task_id,
+      "FAILED",
+      Some("Bilibili 不支持单 BV 超过 200 分P，请调整分段或拆分投稿"),
+    )?;
     append_log(
       &context.app_log_path,
       &format!(
@@ -9438,7 +9507,12 @@ async fn run_submission_upload(
       }
     }
     if aid <= 0 {
-      update_submission_status(&submission_context, &task_id, "FAILED")?;
+      update_submission_status_with_reason(
+        &submission_context,
+        &task_id,
+        "FAILED",
+        Some("无法获取AID，无法更新"),
+      )?;
       return Err("无法获取AID，无法更新".to_string());
     }
     let missing_filename_count = parts
@@ -9453,7 +9527,12 @@ async fn run_submission_upload(
           task_id, missing_filename_count
         ),
       );
-      update_submission_status(&submission_context, &task_id, "FAILED")?;
+      update_submission_status_with_reason(
+        &submission_context,
+        &task_id,
+        "FAILED",
+        Some("存在分段缺少上传信息，请重新上传"),
+      )?;
       return Err("存在分段缺少上传信息，请重新上传".to_string());
     }
     let submit_result =
@@ -9473,7 +9552,7 @@ async fn run_submission_upload(
         Ok(())
       }
       Err(err) => {
-        update_submission_status(&submission_context, &task_id, "FAILED")?;
+        update_submission_status_with_reason(&submission_context, &task_id, "FAILED", Some(&err))?;
         append_log(
           &context.app_log_path,
           &format!("submission_update_submit_fail task_id={} err={}", task_id, err),
@@ -9489,9 +9568,10 @@ async fn run_submission_upload(
         if let Some(collection_id) = detail.task.collection_id {
           if collection_id > 0 {
             let cid = parts.first().map(|item| item.cid).unwrap_or(0);
-            let add_result = add_video_to_collection_with_refresh(
+            let add_result = add_video_to_collection_with_retry(
               &context,
               &auth,
+              &task_id,
               &detail.task.title,
               collection_id,
               result.aid,
@@ -9500,25 +9580,13 @@ async fn run_submission_upload(
             )
             .await;
             if let Err(err) = add_result {
-              if is_collection_not_found_error(&err) {
-                append_log(
-                  &context.app_log_path,
-                  &format!(
-                    "submission_collection_skip task_id={} collection_id={} err={}",
-                    task_id, collection_id, err
-                  ),
-                );
-              } else {
-                update_submission_status(&submission_context, &task_id, "FAILED")?;
-                append_log(
-                  &context.app_log_path,
-                  &format!(
-                    "submission_collection_fail task_id={} collection_id={} err={}",
-                    task_id, collection_id, err
-                  ),
-                );
-                return Err(err);
-              }
+              append_log(
+                &context.app_log_path,
+                &format!(
+                  "submission_collection_warn task_id={} collection_id={} err={}",
+                  task_id, collection_id, err
+                ),
+              );
             }
           }
         }
@@ -9533,7 +9601,7 @@ async fn run_submission_upload(
         Ok(())
       }
       Err(err) => {
-        update_submission_status(&submission_context, &task_id, "FAILED")?;
+        update_submission_status_with_reason(&submission_context, &task_id, "FAILED", Some(&err))?;
         append_log(
           &context.app_log_path,
           &format!("submission_upload_submit_fail task_id={} err={}", task_id, err),
@@ -11490,6 +11558,57 @@ async fn add_video_to_collection_with_refresh(
         .clone()
         .ok_or_else(|| "登录信息缺少CSRF".to_string())?;
       add_video_to_collection(context, &auth, title, season_id, aid, cid, &csrf).await
+    }
+  }
+}
+
+async fn add_video_to_collection_with_retry(
+  context: &UploadContext,
+  auth: &AuthInfo,
+  task_id: &str,
+  title: &str,
+  season_id: i64,
+  aid: i64,
+  cid: i64,
+  csrf: &str,
+) -> Result<(), String> {
+  let mut attempt: u32 = 1;
+  loop {
+    match add_video_to_collection_with_refresh(context, auth, title, season_id, aid, cid, csrf).await
+    {
+      Ok(()) => return Ok(()),
+      Err(err) => {
+        if is_collection_not_found_error(&err) {
+          append_log(
+            &context.app_log_path,
+            &format!(
+              "submission_collection_skip task_id={} collection_id={} err={}",
+              task_id, season_id, err
+            ),
+          );
+          return Ok(());
+        }
+        if attempt >= COLLECTION_BIND_RETRY_LIMIT {
+          append_log(
+            &context.app_log_path,
+            &format!(
+              "submission_collection_retry_exhausted task_id={} collection_id={} attempts={} err={}",
+              task_id, season_id, attempt, err
+            ),
+          );
+          return Err(err);
+        }
+        let wait_secs = collection_bind_retry_delay_secs(attempt);
+        append_log(
+          &context.app_log_path,
+          &format!(
+            "submission_collection_retry_wait task_id={} collection_id={} round={} wait_secs={} err={}",
+            task_id, season_id, attempt, wait_secs, err
+          ),
+        );
+        sleep(Duration::from_secs(wait_secs)).await;
+        attempt = attempt.saturating_add(1);
+      }
     }
   }
 }
@@ -13892,7 +14011,26 @@ fn update_submission_status(
   task_id: &str,
   status: &str,
 ) -> Result<(), String> {
+  update_submission_status_with_reason(context, task_id, status, None)
+}
+
+fn update_submission_status_with_reason(
+  context: &SubmissionContext,
+  task_id: &str,
+  status: &str,
+  reason: Option<&str>,
+) -> Result<(), String> {
   let now = now_rfc3339();
+  let normalized_reason = reason
+    .map(|value| value.trim())
+    .filter(|value| !value.is_empty())
+    .map(|value| value.to_string());
+  let fallback_reason = "任务执行失败，请查看日志".to_string();
+  let final_reason = if status == "FAILED" {
+    Some(normalized_reason.unwrap_or(fallback_reason))
+  } else {
+    None
+  };
   context
     .db
     .with_conn(|conn| {
@@ -13900,6 +14038,17 @@ fn update_submission_status(
         "UPDATE submission_task SET status = ?1, updated_at = ?2 WHERE task_id = ?3",
         (status, &now, task_id),
       )?;
+      if status == "FAILED" {
+        conn.execute(
+          "UPDATE workflow_instances SET error_message = ?1, updated_at = ?2 WHERE task_id = ?3",
+          (final_reason.as_deref(), &now, task_id),
+        )?;
+      } else {
+        conn.execute(
+          "UPDATE workflow_instances SET error_message = NULL, updated_at = ?1 WHERE task_id = ?2",
+          (&now, task_id),
+        )?;
+      }
       Ok(())
     })
     .map_err(|err| err.to_string())?;
@@ -14054,7 +14203,7 @@ fn load_workflow_status(
     .db
     .with_conn(|conn| {
       let mut stmt = conn.prepare(
-        "SELECT status, current_step, progress FROM workflow_instances WHERE task_id = ?1 ORDER BY created_at DESC LIMIT 1",
+        "SELECT status, current_step, progress, error_message FROM workflow_instances WHERE task_id = ?1 ORDER BY created_at DESC LIMIT 1",
       )?;
       let result = stmt
         .query_row([task_id], |row| {
@@ -14063,6 +14212,7 @@ fn load_workflow_status(
             status: row.get(0)?,
             current_step: row.get(1)?,
             progress: progress.unwrap_or(0.0),
+            error_message: row.get(3)?,
           })
         })
         .ok();

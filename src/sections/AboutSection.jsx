@@ -1,4 +1,8 @@
+import { useEffect, useState } from "react";
+import { confirm as dialogConfirm, message as dialogMessage } from "@tauri-apps/plugin-dialog";
 import pkg from "../../package.json";
+import { invokeCommand } from "../lib/tauri";
+import appLogo from "../../src-tauri/icons/128x128.png";
 
 const actionLinks = [
   {
@@ -50,19 +54,87 @@ const openExternal = async (url) => {
 };
 
 export default function AboutSection() {
-  const version = pkg?.version || "unknown";
+  const [version, setVersion] = useState(pkg?.version || "unknown");
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    const loadVersion = async () => {
+      try {
+        const data = await invokeCommand("app_version");
+        const nextVersion = String(data?.version || "").trim();
+        if (active && nextVersion) {
+          setVersion(nextVersion);
+        }
+      } catch (_) {}
+    };
+    loadVersion();
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const handleCheckUpdate = async () => {
+    if (checkingUpdate) {
+      return;
+    }
+    setCheckingUpdate(true);
+    try {
+      const data = await invokeCommand("app_update_check");
+      if (!data?.hasUpdate) {
+        await dialogMessage("已是最新版本。", { title: "检查更新" });
+        return;
+      }
+      const latestVersion = String(data?.latestVersion || "").trim();
+      const currentVersion = String(data?.currentVersion || "").trim();
+      const confirmMessage = `发现新版本 v${latestVersion}（当前 v${currentVersion}），是否前往更新页面？`;
+      const confirmed = await dialogConfirm(confirmMessage, {
+        title: "发现新版本",
+      });
+      if (!confirmed) {
+        return;
+      }
+      const updateUrl = String(data?.downloadUrl || data?.releaseUrl || "").trim();
+      if (updateUrl) {
+        await openExternal(updateUrl);
+      }
+    } catch (error) {
+      await dialogMessage(`检查更新失败：${error?.message || String(error)}`, {
+        title: "检查更新",
+      });
+    } finally {
+      setCheckingUpdate(false);
+    }
+  };
 
   return (
     <div className="space-y-3">
       <div className="panel p-4 space-y-2">
         <div className="space-y-1">
-          <div className="text-lg font-semibold text-[var(--content-color)]">Reaction Cut</div>
-          <div className="desc">
+          <div className="flex items-center gap-3">
+            <img
+              src={appLogo}
+              alt="Reaction Cut Logo"
+              className="h-32 w-32 rounded-xl border border-black/10 bg-white object-cover"
+            />
+            <div className="text-lg font-semibold text-[var(--content-color)]">Reaction Cut</div>
+          </div>
+          <div className="desc leading-loose">
             介绍：支持直播间订阅与手动/自动录制（含弹幕录制配置），支持视频下载（分P选择、多视频、下载+投稿），提供投稿任务的剪辑/合并/分段/更新与重试管理，并内置 FLV 转 MP4 转封装工具。
           </div>
         </div>
-        <div className="space-y-1 text-sm text-[var(--content-color)]">
-          <div>版本：{version}</div>
+        <div className="space-y-1 text-sm leading-loose text-[var(--content-color)]">
+          <div className="flex flex-wrap items-center gap-2">
+            <span>版本：{version}</span>
+            <button
+              type="button"
+              className="inline-flex items-center gap-2 rounded-full border border-[var(--primary-color)] bg-[var(--primary-color)] px-3 py-1 text-xs text-white transition hover:brightness-95 disabled:opacity-60"
+              onClick={handleCheckUpdate}
+              disabled={checkingUpdate}
+            >
+              {checkingUpdate ? "检查中..." : "检查更新"}
+            </button>
+          </div>
           <div className="flex flex-wrap gap-2">
             {actionLinks.map((item) => (
               <button

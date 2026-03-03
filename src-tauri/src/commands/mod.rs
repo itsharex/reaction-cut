@@ -9,3 +9,4 @@ pub mod submission;
 pub mod live;
 pub mod toolbox;
 pub mod baidu_sync;
+pub mod app_update;

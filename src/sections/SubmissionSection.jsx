@@ -3191,6 +3191,21 @@ export default function SubmissionSection() {
     return task?.rejectReason || "-";
   };
 
+  const resolveTaskFailureReason = (task) => {
+    if (task?.status !== "FAILED") {
+      return "-";
+    }
+    const message = String(task?.workflowStatus?.errorMessage || "").trim();
+    if (message) {
+      return message;
+    }
+    const currentStep = String(task?.workflowStatus?.currentStep || "").trim();
+    if (currentStep) {
+      return `${formatWorkflowStep(currentStep)}失败`;
+    }
+    return "-";
+  };
+
   const formatUploadProgress = (value) => {
     const numeric = Number(value);
     if (!Number.isFinite(numeric)) {
@@ -4500,7 +4515,6 @@ export default function SubmissionSection() {
                 <th className="px-6 py-3">BVID</th>
                 <th className="px-6 py-3">UP主</th>
                 <th className="px-6 py-3">投稿状态</th>
-                <th className="px-6 py-3">拒绝原因</th>
                 <th className="px-6 py-3">创建时间</th>
                 <th className="px-6 py-3">更新时间</th>
                 <th className="sticky right-0 z-20 bg-[var(--surface)] px-6 py-3 shadow-[-6px_0_10px_-6px_rgba(0,0,0,0.2)]">
@@ -4511,7 +4525,7 @@ export default function SubmissionSection() {
             <tbody className="whitespace-nowrap">
               {tasks.length === 0 ? (
                 <tr>
-                  <td className="px-6 py-4 text-[var(--muted)]" colSpan={11}>
+                  <td className="px-6 py-4 text-[var(--muted)]" colSpan={10}>
                     暂无任务。
                   </td>
                 </tr>
@@ -4543,13 +4557,26 @@ export default function SubmissionSection() {
                       </button>
                     </td>
                     <td className="px-6 py-3 text-[var(--muted)] whitespace-nowrap">
-                      <span
-                        className={`rounded-full px-2 py-0.5 text-xs font-semibold whitespace-nowrap ${taskStatusTone(
-                          task.status,
-                        )}`}
-                      >
-                        {formatTaskStatus(task.status)}
-                      </span>
+                      {(() => {
+                        const reason = resolveTaskFailureReason(task);
+                        const showTooltip = task?.status === "FAILED" && reason !== "-";
+                        return (
+                          <div className="group relative inline-block">
+                            <span
+                              className={`rounded-full px-2 py-0.5 text-xs font-semibold whitespace-nowrap ${taskStatusTone(
+                                task.status,
+                              )}`}
+                            >
+                              {formatTaskStatus(task.status)}
+                            </span>
+                            {showTooltip ? (
+                              <div className="pointer-events-none absolute left-0 top-full z-50 mt-1 w-[320px] max-w-[360px] rounded-lg border border-black/10 bg-white px-3 py-2 text-xs text-[var(--ink)] shadow-lg opacity-0 transition-opacity duration-150 group-hover:opacity-100">
+                                <div className="whitespace-normal break-words">{reason}</div>
+                              </div>
+                            ) : null}
+                          </div>
+                        );
+                      })()}
                     </td>
                     <td className="px-6 py-3 whitespace-nowrap">
                       {task.workflowStatus ? (
@@ -4609,21 +4636,19 @@ export default function SubmissionSection() {
                       )}
                     </td>
                     <td className="px-6 py-3 text-[var(--muted)] whitespace-nowrap">
-                      <span
-                        className={`rounded-full px-2 py-0.5 text-xs font-semibold whitespace-nowrap ${remoteStatusTone(
-                          resolveRemoteStatus(task),
-                        )}`}
-                      >
-                        {resolveRemoteStatus(task)}
-                      </span>
-                    </td>
-                    <td className="px-6 py-3 text-[var(--muted)] whitespace-nowrap">
                       {(() => {
                         const reason = resolveRejectReason(task);
-                        const showTooltip = reason !== "-" && reason.trim() !== "";
+                        const showTooltip = isRemoteFailed(task) && reason !== "-";
+                        const remoteStatus = resolveRemoteStatus(task);
                         return (
-                          <div className="group relative max-w-[240px]">
-                            <div className="truncate">{reason}</div>
+                          <div className="group relative inline-block">
+                            <span
+                              className={`rounded-full px-2 py-0.5 text-xs font-semibold whitespace-nowrap ${remoteStatusTone(
+                                remoteStatus,
+                              )}`}
+                            >
+                              {remoteStatus}
+                            </span>
                             {showTooltip ? (
                               <div className="pointer-events-none absolute left-0 top-full z-50 mt-1 w-[320px] max-w-[360px] rounded-lg border border-black/10 bg-white px-3 py-2 text-xs text-[var(--ink)] shadow-lg opacity-0 transition-opacity duration-150 group-hover:opacity-100">
                                 <div className="whitespace-normal break-words">{reason}</div>
@@ -4669,22 +4694,18 @@ export default function SubmissionSection() {
                             ) : null}
                           </>
                         ) : null}
-                        {task.status === "COMPLETED" && task.bvid ? (
-                          <button
-                            className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
-                            onClick={() => handleEdit(task.taskId)}
-                          >
-                            编辑
-                          </button>
-                        ) : null}
-                        {task.status === "COMPLETED" && task.bvid ? (
-                          <button
-                            className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
-                            onClick={() => openUpdateModal(task)}
-                          >
-                            视频更新
-                          </button>
-                        ) : null}
+                        <button
+                          className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                          onClick={() => handleEdit(task.taskId)}
+                        >
+                          编辑
+                        </button>
+                        <button
+                          className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                          onClick={() => openUpdateModal(task)}
+                        >
+                          视频更新
+                        </button>
                         <button
                           className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
                           onClick={() => openResegmentModal(task.taskId)}
