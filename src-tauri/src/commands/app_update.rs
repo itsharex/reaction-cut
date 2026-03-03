@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::api::ApiResponse;
 
 const UPDATE_SOURCE: &str = "github_releases_latest";
-const DEFAULT_UPDATE_REPO: &str = "UknowNull/reaction-cut";
+const DEFAULT_UPDATE_REPO: &str = "UknowNull/biliClipFlow";
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -102,7 +102,7 @@ async fn fetch_latest_release() -> Result<GithubRelease, String> {
   let mut headers = HeaderMap::new();
   headers.insert(
     USER_AGENT,
-    HeaderValue::from_static("reaction-cut-rust-update-check"),
+    HeaderValue::from_static("biliClipFlow-update-check"),
   );
   headers.insert(ACCEPT, HeaderValue::from_static("application/vnd.github+json"));
   let client = reqwest::Client::builder()

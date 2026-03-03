@@ -679,7 +679,7 @@ fn resolve_database_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
   app
     .path()
     .app_data_dir()
-    .map(|path| path.join("reaction-cut-rust.sqlite3"))
+    .map(|path| crate::config::database_path(path.as_path()))
     .map_err(|err| format!("解析数据库路径失败: {}", err))
 }
 

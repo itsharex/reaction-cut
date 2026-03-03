@@ -95,7 +95,7 @@ BIN_DOWNLOAD=1 pnpm exec tauri build --bundles nsis,msi
 ## 运行数据位置（macOS）
 
 - 数据目录：`~/Library/Application Support/com.tbw.reaction-cut-rust/`
-- 数据库：`reaction-cut-rust.sqlite3`
+- 数据库：`bili-clip-flow.sqlite3`
 - 日志：`app_debug.log` / `auth_debug.log` / `panic_debug.log`
 
 ## 界面预览

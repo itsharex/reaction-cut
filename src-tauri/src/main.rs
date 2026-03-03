@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    reaction_cut_rust_lib::run()
+    bili_clip_flow_lib::run()
 }

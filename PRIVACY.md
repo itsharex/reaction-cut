@@ -11,7 +11,7 @@ This application runs locally. It does not operate a remote server.
 ## Storage locations (macOS)
 
 - App data: `~/Library/Application Support/com.tbw.reaction-cut-rust/`
-- Database: `reaction-cut-rust.sqlite3`
+- Database: `bili-clip-flow.sqlite3`
 - Logs: `app_debug.log`, `auth_debug.log`, `panic_debug.log`
 
 ## Network access

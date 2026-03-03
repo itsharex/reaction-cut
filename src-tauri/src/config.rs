@@ -1,7 +1,7 @@
 use std::env;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tauri::path::BaseDirectory;
 use tauri::AppHandle;
@@ -11,12 +11,38 @@ pub const DEFAULT_FFMPEG_PATH: &str = "/opt/homebrew/bin/ffmpeg";
 pub const DEFAULT_FFPROBE_PATH: &str = "/opt/homebrew/bin/ffprobe";
 pub const DEFAULT_ARIA2C_PATH: &str = "/opt/homebrew/bin/aria2c";
 pub const DEFAULT_BAIDU_PCS_PATH: &str = "/opt/homebrew/bin/BaiduPCS-Go";
+pub const DATABASE_FILE_NAME: &str = "bili-clip-flow.sqlite3";
+pub const LEGACY_DATABASE_FILE_NAME: &str = "reaction-cut-rust.sqlite3";
 
 const ENV_FFMPEG_PATH: &str = "REACTION_CUT_FFMPEG_PATH";
 const ENV_FFPROBE_PATH: &str = "REACTION_CUT_FFPROBE_PATH";
 const ENV_ARIA2C_PATH: &str = "REACTION_CUT_ARIA2C_PATH";
 const ENV_BAIDU_PCS_PATH: &str = "REACTION_CUT_BAIDU_PCS_PATH";
 const ENV_BAIDU_PCS_CONFIG_DIR: &str = "BAIDUPCS_GO_CONFIG_DIR";
+
+pub fn database_path(app_data_dir: &Path) -> PathBuf {
+  app_data_dir.join(DATABASE_FILE_NAME)
+}
+
+pub fn resolve_or_migrate_database_path(app_data_dir: &Path) -> std::io::Result<PathBuf> {
+  let current = database_path(app_data_dir);
+  if current.exists() {
+    return Ok(current);
+  }
+
+  let legacy = app_data_dir.join(LEGACY_DATABASE_FILE_NAME);
+  if !legacy.exists() {
+    return Ok(current);
+  }
+
+  match std::fs::rename(&legacy, &current) {
+    Ok(()) => Ok(current),
+    Err(_) => {
+      std::fs::copy(&legacy, &current)?;
+      Ok(current)
+    }
+  }
+}
 
 fn resolve_home_dir() -> Option<PathBuf> {
   if cfg!(target_os = "windows") {

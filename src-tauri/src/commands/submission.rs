@@ -4782,9 +4782,18 @@ pub async fn submission_list(
   refresh_remote: Option<bool>,
 ) -> Result<ApiResponse<PaginatedSubmissionTasks>, String> {
   let context = SubmissionContext::new(&state);
-  let bilibili_uid = match require_current_bilibili_uid(&state) {
-    Ok(value) => value,
-    Err(err) => return Ok(ApiResponse::error(err)),
+  let page = page.unwrap_or(1).max(1);
+  let page_size = page_size.or(pageSize).unwrap_or(20).max(1);
+  let bilibili_uid = match resolve_submission_list_bilibili_uid(&state, &context)? {
+    Some(value) => value,
+    None => {
+      return Ok(ApiResponse::success(PaginatedSubmissionTasks {
+        items: Vec::new(),
+        total: 0,
+        page,
+        page_size,
+      }))
+    }
   };
   if refresh_remote.unwrap_or(false) {
     let queue_context = build_submission_queue_context(&state);
@@ -4795,8 +4804,6 @@ pub async fn submission_list(
       );
     }
   }
-  let page = page.unwrap_or(1).max(1);
-  let page_size = page_size.or(pageSize).unwrap_or(20).max(1);
   let response = match load_tasks(&context, None, page, page_size, query, bilibili_uid) {
     Ok(result) => ApiResponse::success(result),
     Err(err) => ApiResponse::error(format!("Failed to load tasks: {}", err)),
@@ -4816,9 +4823,18 @@ pub async fn submission_list_by_status(
   refresh_remote: Option<bool>,
 ) -> Result<ApiResponse<PaginatedSubmissionTasks>, String> {
   let context = SubmissionContext::new(&state);
-  let bilibili_uid = match require_current_bilibili_uid(&state) {
-    Ok(value) => value,
-    Err(err) => return Ok(ApiResponse::error(err)),
+  let page = page.unwrap_or(1).max(1);
+  let page_size = page_size.or(pageSize).unwrap_or(20).max(1);
+  let bilibili_uid = match resolve_submission_list_bilibili_uid(&state, &context)? {
+    Some(value) => value,
+    None => {
+      return Ok(ApiResponse::success(PaginatedSubmissionTasks {
+        items: Vec::new(),
+        total: 0,
+        page,
+        page_size,
+      }))
+    }
   };
   if refresh_remote.unwrap_or(false) {
     let queue_context = build_submission_queue_context(&state);
@@ -4832,8 +4848,6 @@ pub async fn submission_list_by_status(
       );
     }
   }
-  let page = page.unwrap_or(1).max(1);
-  let page_size = page_size.or(pageSize).unwrap_or(20).max(1);
   let response = match load_tasks(
     &context,
     Some(status),
@@ -6759,6 +6773,34 @@ fn require_current_bilibili_uid(state: &State<'_, AppState>) -> Result<i64, Stri
     .flatten()
     .ok_or_else(|| "请先登录B站账号".to_string())?;
   auth.user_id.ok_or_else(|| "请先登录B站账号".to_string())
+}
+
+fn resolve_submission_list_bilibili_uid(
+  state: &State<'_, AppState>,
+  context: &SubmissionContext,
+) -> Result<Option<i64>, String> {
+  if let Ok(uid) = require_current_bilibili_uid(state) {
+    return Ok(Some(uid));
+  }
+  let fallback_uid = context
+    .db
+    .with_conn(|conn| {
+      conn
+        .query_row(
+          "SELECT bilibili_uid FROM submission_task ORDER BY created_at DESC LIMIT 1",
+          [],
+          |row| row.get::<_, i64>(0),
+        )
+        .optional()
+    })
+    .map_err(|err| err.to_string())?;
+  if let Some(uid) = fallback_uid {
+    append_log(
+      &state.app_log_path,
+      &format!("submission_list_uid_fallback uid={}", uid),
+    );
+  }
+  Ok(fallback_uid)
 }
 
 fn load_logged_baidu_uid(db: &Db) -> Result<Option<String>, String> {

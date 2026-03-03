@@ -11,7 +11,7 @@ const actionLinks = [
   },
   {
     buttonText: "GitHub仓库",
-    url: "https://github.com/tianbowen14300/reaction-cut-rust",
+    url: "https://github.com/UknowNull/biliClipFlow",
   },
   {
     buttonText: "视频教程",
@@ -19,7 +19,7 @@ const actionLinks = [
   },
   {
     buttonText: "反馈地址",
-    url: "https://github.com/tianbowen14300/reaction-cut-rust/issues",
+    url: "https://github.com/UknowNull/biliClipFlow/issues",
   },
 ];
 
