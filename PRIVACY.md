@@ -10,7 +10,7 @@ This application runs locally. It does not operate a remote server.
 
 ## Storage locations (macOS)
 
-- App data: `~/Library/Application Support/com.tbw.reaction-cut-rust/`
+- App data: `~/Library/Application Support/com.tbw.biliclipflow/`
 - Database: `bili-clip-flow.sqlite3`
 - Logs: `app_debug.log`, `auth_debug.log`, `panic_debug.log`
 

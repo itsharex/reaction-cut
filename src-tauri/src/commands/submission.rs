@@ -6780,7 +6780,24 @@ fn resolve_submission_list_bilibili_uid(
   context: &SubmissionContext,
 ) -> Result<Option<i64>, String> {
   if let Ok(uid) = require_current_bilibili_uid(state) {
-    return Ok(Some(uid));
+    let current_uid_has_tasks = context
+      .db
+      .with_conn(|conn| {
+        conn.query_row(
+          "SELECT EXISTS(SELECT 1 FROM submission_task WHERE bilibili_uid = ?1 LIMIT 1)",
+          [uid],
+          |row| row.get::<_, i64>(0),
+        )
+      })
+      .map_err(|err| err.to_string())?
+      != 0;
+    if current_uid_has_tasks {
+      return Ok(Some(uid));
+    }
+    append_log(
+      &state.app_log_path,
+      &format!("submission_list_uid_no_tasks current_uid={}", uid),
+    );
   }
   let fallback_uid = context
     .db

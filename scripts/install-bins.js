@@ -95,7 +95,7 @@ function downloadFile(url, targetPath) {
       const client = nextUrl.startsWith("https:") ? https : http;
       const req = client.get(
         nextUrl,
-        { headers: { "User-Agent": "reaction-cut-rust/install-bins" } },
+        { headers: { "User-Agent": "bili-clip-flow/install-bins" } },
         (res) => {
           if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
             const redirectUrl = new URL(res.headers.location, nextUrl).toString();
@@ -123,7 +123,7 @@ function fetchJson(url) {
       url,
       {
         headers: {
-          "User-Agent": "reaction-cut-rust/install-bins",
+          "User-Agent": "bili-clip-flow/install-bins",
           Accept: "application/vnd.github+json",
           ...(process.env.GITHUB_TOKEN ? { Authorization: `Bearer ${process.env.GITHUB_TOKEN}` } : {}),
         },

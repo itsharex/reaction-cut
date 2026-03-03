@@ -81,10 +81,10 @@ pub fn run() {
             }
         })
         .setup(|app| {
-            config::init_resource_bins(&app.handle());
             let app_dir = app.path().app_data_dir()?;
+            config::init_resource_bins(&app.handle());
             std::fs::create_dir_all(&app_dir)?;
-            let db_path = config::resolve_or_migrate_database_path(&app_dir)?;
+            let db_path = config::database_path(&app_dir);
             let db = Arc::new(db::Db::new(db_path)?);
             let login_path = app_dir.join("bilibili_login_info.json");
             let download_dir = commands::settings::load_download_settings_from_db(&db)
