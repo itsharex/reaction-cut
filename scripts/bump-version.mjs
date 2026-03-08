@@ -50,17 +50,17 @@ function writeJson(filePath, data) {
 }
 
 function updateCargoTomlVersion(tomlText, version) {
-  const packageSectionPattern = /(\[package\][\s\S]*?)(?=\n\[|$)/;
+  const packageSectionPattern = /(\[package\][\s\S]*?)(?=\r?\n\[|$)/;
   const sectionMatch = tomlText.match(packageSectionPattern);
   if (!sectionMatch) {
     throw new Error("Cargo.toml 缺少 [package] 段落");
   }
   const section = sectionMatch[1];
-  const versionPattern = /^\s*version\s*=\s*\"[^\"]+\"\s*$/m;
+  const versionPattern = /^(\s*version\s*=\s*)"[^"]+"([^\S\r\n]*(?:\r?))$/m;
   if (!versionPattern.test(section)) {
     throw new Error("Cargo.toml 未找到 version 字段");
   }
-  const updatedSection = section.replace(versionPattern, `version = \"${version}\"`);
+  const updatedSection = section.replace(versionPattern, `$1"${version}"$2`);
   return tomlText.replace(packageSectionPattern, updatedSection);
 }
 
