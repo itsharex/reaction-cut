@@ -202,6 +202,12 @@ async fn fetch_bilibili_topic_items(
   title: Option<&str>,
   auth: &AuthInfo,
 ) -> Result<Vec<Value>, String> {
+  if let Some(title) = title {
+    let trimmed = title.trim();
+    if !trimmed.is_empty() {
+      return fetch_bilibili_topic_search_items(state, trimmed, auth).await;
+    }
+  }
   let url = "https://member.bilibili.com/x/vupre/web/topic/type/v2";
   let timestamp = Utc::now().timestamp_millis();
   let mut page = 0;
@@ -288,6 +294,83 @@ async fn fetch_bilibili_topic_items(
       break;
     }
     page += 1;
+  }
+
+  Ok(topics)
+}
+
+async fn fetch_bilibili_topic_search_items(
+  state: &State<'_, AppState>,
+  keywords: &str,
+  auth: &AuthInfo,
+) -> Result<Vec<Value>, String> {
+  let url = "https://member.bilibili.com/x/vupre/web/topic/search";
+  let timestamp = Utc::now().timestamp_millis();
+  let page_size = 50;
+  let mut offset = 0_i64;
+  let mut topics = Vec::new();
+  let mut seen = HashSet::new();
+
+  loop {
+    let params = vec![
+      ("keywords".to_string(), keywords.to_string()),
+      ("page_size".to_string(), page_size.to_string()),
+      ("offset".to_string(), offset.to_string()),
+      ("t".to_string(), timestamp.to_string()),
+    ];
+    append_log(
+      &state.app_log_path,
+      &format!(
+        "topics_search_request offset={} page_size={} keywords={}",
+        offset, page_size, keywords
+      ),
+    );
+    let data = state
+      .bilibili
+      .get_json(url, &params, Some(auth), false)
+      .await
+      .map_err(|err| format!("Failed to search topics: {}", err))?;
+    let result = data.get("result");
+    let topics_data = result
+      .and_then(|value| value.get("topics"))
+      .and_then(|value| value.as_array())
+      .cloned()
+      .unwrap_or_default();
+    for item in &topics_data {
+      let topic_id = item
+        .get("id")
+        .or_else(|| item.get("topic_id"))
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0);
+      if topic_id <= 0 || !seen.insert(topic_id) {
+        continue;
+      }
+      topics.push(item.clone());
+    }
+    let page_info = result.and_then(|value| value.get("page_info"));
+    let has_more = page_info
+      .and_then(|value| value.get("has_more"))
+      .and_then(|value| value.as_bool())
+      .unwrap_or(false);
+    let next_offset = page_info
+      .and_then(|value| value.get("offset"))
+      .and_then(|value| value.as_i64())
+      .unwrap_or(offset + page_size as i64);
+    append_log(
+      &state.app_log_path,
+      &format!(
+        "topics_search_response offset={} fetched={} dedup_total={} next_offset={} has_more={}",
+        offset,
+        topics_data.len(),
+        topics.len(),
+        next_offset,
+        has_more
+      ),
+    );
+    if !has_more || topics_data.is_empty() {
+      break;
+    }
+    offset = next_offset;
   }
 
   Ok(topics)
@@ -665,6 +748,7 @@ pub async fn bilibili_topics(
   for item in &raw_items {
     let topic_id = item
       .get("topic_id")
+      .or_else(|| item.get("id"))
       .and_then(|value| value.as_i64())
       .unwrap_or(0);
     let mission_id = item
@@ -673,6 +757,7 @@ pub async fn bilibili_topics(
       .unwrap_or(0);
     let name = item
       .get("topic_name")
+      .or_else(|| item.get("name"))
       .and_then(|value| value.as_str())
       .unwrap_or_default()
       .to_string();
@@ -683,10 +768,12 @@ pub async fn bilibili_topics(
       .map(|value| value.to_string());
     let activity_text = item
       .get("activity_text")
+      .or_else(|| item.get("activity_sign"))
       .and_then(|value| value.as_str())
       .map(|value| value.to_string());
     let activity_description = item
       .get("activity_description")
+      .or_else(|| item.get("act_protocol"))
       .and_then(|value| value.as_str())
       .map(|value| value.to_string());
     let read_count = parse_topic_counter(

@@ -9448,15 +9448,14 @@ fn map_submission_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<SubmissionTa
   })
 }
 
-fn load_task_detail(
+fn load_task_record(
   context: &SubmissionContext,
   task_id: &str,
-) -> Result<SubmissionTaskDetail, String> {
-  let path_prefix = context.local_path_prefix.clone();
-  let mut detail = context
+) -> Result<SubmissionTaskRecord, String> {
+  context
     .db
     .with_conn(|conn| {
-      let task = conn.query_row(
+      conn.query_row(
         "SELECT st.task_id, st.status, st.priority, st.title, st.description, st.cover_url, st.cover_local_path, st.partition_id, st.tags, st.topic_id, st.mission_id, st.activity_title, st.video_type, st.collection_id, st.bvid, st.aid, st.remote_state, st.reject_reason, st.created_at, st.updated_at, st.segment_prefix, st.import_mode, wc.configuration_data, st.baidu_sync_enabled, st.baidu_sync_path, st.baidu_sync_filename, \
                 CASE WHEN EXISTS (SELECT 1 FROM task_relations tr WHERE tr.submission_task_id = st.task_id) THEN 1 ELSE 0 END, \
                 wi.status, wi.current_step, wi.progress, wi.error_message \
@@ -9466,8 +9465,20 @@ fn load_task_detail(
          WHERE st.task_id = ?1",
         [task_id],
         map_submission_task,
-      )?;
+      )
+    })
+    .map_err(|err| err.to_string())
+}
 
+fn load_task_detail(
+  context: &SubmissionContext,
+  task_id: &str,
+) -> Result<SubmissionTaskDetail, String> {
+  let path_prefix = context.local_path_prefix.clone();
+  let task = load_task_record(context, task_id)?;
+  let mut detail = context
+    .db
+    .with_conn(|conn| {
       let mut source_stmt = conn.prepare(
         "SELECT id, task_id, source_file_path, sort_order, start_time, end_time FROM task_source_video WHERE task_id = ?1 ORDER BY sort_order ASC",
       )?;
@@ -10468,6 +10479,17 @@ async fn run_submission_workflow(
         workflow_settings.segment_prefix.as_deref(),
       )?;
     }
+  } else if !is_update_workflow {
+    let task = load_task_record(&context, &task_id)?;
+    if is_non_segmented_task(&task) {
+      save_output_segments(
+        &context,
+        &task_id,
+        &[merge_output.clone()],
+        Some(merged_id),
+        workflow_settings.segment_prefix.as_deref(),
+      )?;
+    }
   }
   if is_update_workflow && !workflow_settings.enable_segmentation {
     let (existing_count, max_order) = load_output_segment_stats(&context, &task_id)?;
@@ -10677,8 +10699,11 @@ const COLLECTION_BIND_RETRY_BASE_DELAY_SECS: u64 = 5;
 const COLLECTION_BIND_RETRY_MAX_DELAY_SECS: u64 = 30;
 const REMOTE_AUDIT_STATUS_REVIEWING: &str = "is_pubing";
 const REMOTE_AUDIT_STATUS_REJECTED: &str = "not_pubed";
+const REMOTE_AUDIT_STATUS_PUBLISHED: &str = "pubed";
 const REMOTE_AUDIT_STATUS_SCOPE: &str = "is_pubing|not_pubed";
 const REMOTE_DEBUG_BVID: &str = "BV1VJkFBZENQ";
+const REMOTE_PART_VERIFY_RETRY_LIMIT: u32 = 5;
+const REMOTE_PART_VERIFY_RETRY_WAIT_SECS: u64 = 2;
 const UPLOAD_RETRY_BASE_DELAY_SECS: u64 = 2;
 const UPLOAD_RETRY_MAX_DELAY_SECS: u64 = 30;
 const PREUPLOAD_PARSE_RETRY_BASE_SECS: u64 = 60;
@@ -10877,6 +10902,219 @@ fn build_uploaded_parts(
   Ok(parts)
 }
 
+fn is_non_segmented_task(task: &SubmissionTaskRecord) -> bool {
+  task.import_mode == IMPORT_MODE_NON_SEGMENTED && !task.enable_segmentation
+}
+
+fn should_use_output_segments_upload(
+  detail: &SubmissionTaskDetail,
+  is_update_workflow: bool,
+) -> bool {
+  is_update_workflow
+    || detail.task.enable_segmentation
+    || (is_non_segmented_task(&detail.task) && !detail.output_segments.is_empty())
+}
+
+fn should_validate_non_segmented_consistency(
+  detail: &SubmissionTaskDetail,
+  is_update_workflow: bool,
+) -> bool {
+  is_non_segmented_task(&detail.task)
+    && (is_update_workflow || !detail.output_segments.is_empty())
+}
+
+fn validate_non_segmented_submission_consistency(
+  detail: &SubmissionTaskDetail,
+  parts: &[UploadedVideoPart],
+) -> Result<(), String> {
+  let merged_count = detail.merged_videos.len();
+  let segment_count = detail.output_segments.len();
+  let part_count = parts.len();
+  if segment_count == 0 {
+    return Err("非分段任务缺少本地分P记录，请重新执行视频处理".to_string());
+  }
+  if merged_count != segment_count {
+    return Err(format!(
+      "非分段任务本地合并视频数与分P记录数不一致（合并={}，分P={}），请先修复任务数据",
+      merged_count, segment_count
+    ));
+  }
+  if part_count != segment_count {
+    return Err(format!(
+      "非分段任务待提交分P数与本地分P记录数不一致（提交={}，分P={}），请重新上传分P",
+      part_count, segment_count
+    ));
+  }
+  Ok(())
+}
+
+fn parse_remote_archive_part_count(
+  item: &Value,
+  expected_bvid: &str,
+  expected_aid: i64,
+) -> Option<(i64, String, usize)> {
+  let archive = item.get("Archive")?;
+  let archive_aid = archive.get("aid").and_then(|value| value.as_i64()).unwrap_or(0);
+  let archive_bvid = archive
+    .get("bvid")
+    .and_then(|value| value.as_str())
+    .unwrap_or("")
+    .trim()
+    .to_string();
+  let aid_matches = expected_aid > 0 && archive_aid == expected_aid;
+  let bvid_matches = !expected_bvid.is_empty() && archive_bvid == expected_bvid;
+  if !aid_matches && !bvid_matches {
+    return None;
+  }
+  let cid_count = item
+    .get("cid_list")
+    .and_then(|value| value.as_array())
+    .map(|items| items.len())
+    .or_else(|| {
+      archive
+        .get("cid_list")
+        .and_then(|value| value.as_array())
+        .map(|items| items.len())
+    })
+    .unwrap_or(0);
+  let video_count = archive
+    .get("videos")
+    .and_then(|value| value.as_array())
+    .map(|items| items.len())
+    .unwrap_or(0);
+  Some((archive_aid, archive_bvid, cid_count.max(video_count).max(1)))
+}
+
+async fn fetch_remote_archive_part_count_by_status(
+  context: &UploadContext,
+  auth: &AuthInfo,
+  bvid: &str,
+  aid: i64,
+  status: &str,
+) -> Result<Option<usize>, String> {
+  let mut page = 1_i64;
+  let page_size = 20_i64;
+  let normalized_bvid = bvid.trim();
+  loop {
+    let params = vec![
+      ("status".to_string(), status.to_string()),
+      ("pn".to_string(), page.to_string()),
+      ("ps".to_string(), page_size.to_string()),
+      ("coop".to_string(), "1".to_string()),
+      ("interactive".to_string(), "1".to_string()),
+    ];
+    let data = context
+      .bilibili
+      .get_json(
+        "https://member.bilibili.com/x/web/archives",
+        &params,
+        Some(auth),
+        false,
+      )
+      .await?;
+    let arc_audits = data
+      .get("arc_audits")
+      .and_then(|value| value.as_array())
+      .cloned()
+      .unwrap_or_default();
+    for item in &arc_audits {
+      let Some((archive_aid, archive_bvid, part_count)) =
+        parse_remote_archive_part_count(item, normalized_bvid, aid)
+      else {
+        continue;
+      };
+      append_log(
+        &context.app_log_path,
+        &format!(
+          "submission_remote_part_count_found status={} aid={} bvid={} parts={}",
+          status, archive_aid, archive_bvid, part_count
+        ),
+      );
+      return Ok(Some(part_count));
+    }
+    let total_count = data
+      .get("page")
+      .and_then(|value| value.get("count"))
+      .and_then(|value| value.as_i64())
+      .unwrap_or(0);
+    if total_count <= 0 || page * page_size >= total_count || arc_audits.is_empty() {
+      break;
+    }
+    page += 1;
+  }
+  Ok(None)
+}
+
+async fn fetch_remote_archive_part_count(
+  context: &UploadContext,
+  auth: &AuthInfo,
+  bvid: &str,
+  aid: i64,
+) -> Result<Option<usize>, String> {
+  for status in [
+    REMOTE_AUDIT_STATUS_REVIEWING,
+    REMOTE_AUDIT_STATUS_REJECTED,
+    REMOTE_AUDIT_STATUS_PUBLISHED,
+  ] {
+    if let Some(part_count) =
+      fetch_remote_archive_part_count_by_status(context, auth, bvid, aid, status).await?
+    {
+      return Ok(Some(part_count));
+    }
+  }
+  Ok(None)
+}
+
+async fn verify_remote_part_count(
+  context: &UploadContext,
+  auth: &AuthInfo,
+  task_id: &str,
+  bvid: &str,
+  aid: i64,
+  expected_parts: usize,
+) -> Result<(), String> {
+  let mut last_error: Option<String> = None;
+  for attempt in 1..=REMOTE_PART_VERIFY_RETRY_LIMIT {
+    match fetch_remote_archive_part_count(context, auth, bvid, aid).await {
+      Ok(Some(actual_parts)) if actual_parts == expected_parts => {
+        append_log(
+          &context.app_log_path,
+          &format!(
+            "submission_remote_part_count_verified task_id={} attempt={} expected={} actual={}",
+            task_id, attempt, expected_parts, actual_parts
+          ),
+        );
+        return Ok(());
+      }
+      Ok(Some(actual_parts)) => {
+        last_error = Some(format!(
+          "远程分P数量与本地不一致（本地={}，远程={}）",
+          expected_parts, actual_parts
+        ));
+      }
+      Ok(None) => {
+        last_error = Some("暂未读取到远程稿件分P信息".to_string());
+      }
+      Err(err) => {
+        last_error = Some(err);
+      }
+    }
+    if attempt < REMOTE_PART_VERIFY_RETRY_LIMIT {
+      append_log(
+        &context.app_log_path,
+        &format!(
+          "submission_remote_part_count_retry task_id={} attempt={} reason={}",
+          task_id,
+          attempt,
+          last_error.as_deref().unwrap_or("unknown")
+        ),
+      );
+      sleep(Duration::from_secs(REMOTE_PART_VERIFY_RETRY_WAIT_SECS)).await;
+    }
+  }
+  Err(last_error.unwrap_or_else(|| "远程分P数量校验失败".to_string()))
+}
+
 async fn run_submission_upload(
   context: UploadContext,
   task_id: String,
@@ -10962,15 +11200,15 @@ async fn run_submission_upload(
 
   update_submission_status(&submission_context, &task_id, "UPLOADING")?;
 
-  let settings = load_workflow_settings(&submission_context, &task_id);
   let upload_concurrency = load_download_settings_from_db(&submission_context.db)
     .map(|settings| settings.upload_concurrency)
     .unwrap_or(DEFAULT_UPLOAD_CONCURRENCY)
     .max(1) as usize;
   let client = Client::new();
   let mut parts: Vec<UploadedVideoPart> = Vec::new();
+  let use_output_segments_upload = should_use_output_segments_upload(&detail, is_update_workflow);
 
-  if is_update_workflow || settings.enable_segmentation {
+  if use_output_segments_upload {
     if detail.output_segments.is_empty() {
       update_submission_status_with_reason(
         &submission_context,
@@ -11199,6 +11437,27 @@ async fn run_submission_upload(
     });
   }
 
+  if should_validate_non_segmented_consistency(&detail, is_update_workflow) {
+    append_log(
+      &context.app_log_path,
+      &format!(
+        "submission_non_segmented_consistency_check task_id={} merged={} segments={} parts={}",
+        task_id,
+        detail.merged_videos.len(),
+        detail.output_segments.len(),
+        parts.len()
+      ),
+    );
+    if let Err(err) = validate_non_segmented_submission_consistency(&detail, &parts) {
+      update_submission_status_with_reason(&submission_context, &task_id, "FAILED", Some(&err))?;
+      append_log(
+        &context.app_log_path,
+        &format!("submission_non_segmented_consistency_fail task_id={} err={}", task_id, err),
+      );
+      return Err(err);
+    }
+  }
+
   if parts.is_empty() {
     update_submission_status_with_reason(
       &submission_context,
@@ -11292,6 +11551,23 @@ async fn run_submission_upload(
       submit_video_update_in_batches(&context, &auth, &detail.task, &parts, aid, &csrf).await;
     match submit_result {
       Ok(()) => {
+        if let Err(err) = verify_remote_part_count(
+          &context,
+          &auth,
+          &task_id,
+          detail.task.bvid.as_deref().unwrap_or(""),
+          aid,
+          parts.len(),
+        )
+        .await
+        {
+          update_submission_status_with_reason(&submission_context, &task_id, "FAILED", Some(&err))?;
+          append_log(
+            &context.app_log_path,
+            &format!("submission_update_remote_part_mismatch task_id={} err={}", task_id, err),
+          );
+          return Err(err);
+        }
         update_submission_status(&submission_context, &task_id, "COMPLETED")?;
         append_log(
           &context.app_log_path,
@@ -11318,6 +11594,23 @@ async fn run_submission_upload(
     match submit_result {
       Ok(result) => {
         update_submission_bvid_and_aid(&submission_context, &task_id, &result.bvid, result.aid)?;
+        if let Err(err) = verify_remote_part_count(
+          &context,
+          &auth,
+          &task_id,
+          &result.bvid,
+          result.aid,
+          parts.len(),
+        )
+        .await
+        {
+          update_submission_status_with_reason(&submission_context, &task_id, "FAILED", Some(&err))?;
+          append_log(
+            &context.app_log_path,
+            &format!("submission_upload_remote_part_mismatch task_id={} err={}", task_id, err),
+          );
+          return Err(err);
+        }
         if let Some(collection_id) = detail.task.collection_id {
           if collection_id > 0 {
             let cid = parts.first().map(|item| item.cid).unwrap_or(0);
@@ -16310,6 +16603,100 @@ mod tests {
   use rusqlite::Connection;
   use serde_json::json;
 
+  fn build_test_task(import_mode: &str, enable_segmentation: bool) -> SubmissionTaskRecord {
+    SubmissionTaskRecord {
+      task_id: "task-1".to_string(),
+      status: "PENDING".to_string(),
+      priority: false,
+      title: "test".to_string(),
+      description: None,
+      cover_url: None,
+      cover_local_path: None,
+      partition_id: 21,
+      tags: Some("tag".to_string()),
+      topic_id: None,
+      mission_id: None,
+      activity_title: None,
+      video_type: "ORIGINAL".to_string(),
+      collection_id: None,
+      bvid: Some("BV1test".to_string()),
+      aid: Some(1),
+      remote_state: None,
+      reject_reason: None,
+      created_at: "2026-03-10 09:18:11".to_string(),
+      updated_at: "2026-03-10 09:18:11".to_string(),
+      segment_prefix: None,
+      import_mode: import_mode.to_string(),
+      enable_segmentation,
+      baidu_sync_enabled: false,
+      baidu_sync_path: None,
+      baidu_sync_filename: None,
+      has_integrated_downloads: false,
+      workflow_status: None,
+    }
+  }
+
+  fn build_test_detail(merged_count: usize, segment_count: usize) -> SubmissionTaskDetail {
+    let merged_videos = (0..merged_count)
+      .map(|index| MergedVideoRecord {
+        id: index as i64 + 1,
+        task_id: "task-1".to_string(),
+        file_name: Some(format!("merged-{}.mp4", index + 1)),
+        video_path: Some(format!("merged/{}.mp4", index + 1)),
+        source_video_ids: Vec::new(),
+        source_video_paths: Vec::new(),
+        remote_dir: None,
+        remote_name: None,
+        duration: None,
+        status: 0,
+        upload_progress: 0.0,
+        upload_uploaded_bytes: 0,
+        upload_total_bytes: 0,
+        upload_cid: Some(index as i64 + 100),
+        upload_file_name: Some(format!("uploaded-{}", index + 1)),
+        upload_session_id: None,
+        upload_biz_id: 0,
+        upload_endpoint: None,
+        upload_auth: None,
+        upload_uri: None,
+        upload_chunk_size: 0,
+        upload_last_part_index: 0,
+        create_time: "2026-03-10 09:18:11".to_string(),
+        update_time: "2026-03-10 09:18:11".to_string(),
+      })
+      .collect();
+    let output_segments = (0..segment_count)
+      .map(|index| TaskOutputSegmentRecord {
+        segment_id: format!("segment-{}", index + 1),
+        task_id: "task-1".to_string(),
+        merged_id: Some(index as i64 + 1),
+        part_name: format!("P{}", index + 1),
+        segment_file_path: format!("segments/{}.mp4", index + 1),
+        part_order: index as i64 + 1,
+        upload_status: "SUCCESS".to_string(),
+        cid: Some(index as i64 + 1000),
+        file_name: Some(format!("file-{}", index + 1)),
+        upload_progress: 100.0,
+        upload_uploaded_bytes: 1,
+        upload_total_bytes: 1,
+        upload_session_id: None,
+        upload_biz_id: 0,
+        upload_endpoint: None,
+        upload_auth: None,
+        upload_uri: None,
+        upload_chunk_size: 0,
+        upload_last_part_index: 0,
+      })
+      .collect();
+    SubmissionTaskDetail {
+      task: build_test_task(IMPORT_MODE_NON_SEGMENTED, false),
+      source_videos: Vec::new(),
+      output_segments,
+      merged_videos,
+      workflow_config: None,
+    }
+  }
+
   fn setup_import_test_db() -> Connection {
     let conn = Connection::open_in_memory().expect("open in-memory sqlite");
     conn
@@ -16553,5 +16940,55 @@ mod tests {
   fn format_timecode_seconds_handles_rounding_carry() {
     assert_eq!(format_timecode_seconds(7199.999667), "02:00:00");
     assert_eq!(format_timecode_seconds(59.9996), "00:01:00");
+  }
+
+  #[test]
+  fn non_segmented_initial_upload_uses_output_segments_when_p1_exists() {
+    let detail = build_test_detail(1, 1);
+    assert!(should_use_output_segments_upload(&detail, false));
+  }
+
+  #[test]
+  fn validate_non_segmented_submission_consistency_rejects_count_mismatch() {
+    let detail = build_test_detail(3, 2);
+    let parts = vec![
+      UploadedVideoPart {
+        filename: "file-1".to_string(),
+        cid: 1,
+        title: "P1".to_string(),
+      },
+      UploadedVideoPart {
+        filename: "file-2".to_string(),
+        cid: 2,
+        title: "P2".to_string(),
+      },
+    ];
+    let err = validate_non_segmented_submission_consistency(&detail, &parts)
+      .expect_err("should reject mismatch");
+    assert!(err.contains("合并视频数与分P记录数不一致"));
+  }
+
+  #[test]
+  fn validate_non_segmented_submission_consistency_accepts_aligned_counts() {
+    let detail = build_test_detail(3, 3);
+    let parts = vec![
+      UploadedVideoPart {
+        filename: "file-1".to_string(),
+        cid: 1,
+        title: "P1".to_string(),
+      },
+      UploadedVideoPart {
+        filename: "file-2".to_string(),
+        cid: 2,
+        title: "P2".to_string(),
+      },
+      UploadedVideoPart {
+        filename: "file-3".to_string(),
+        cid: 3,
+        title: "P3".to_string(),
+      },
+    ];
+    validate_non_segmented_submission_consistency(&detail, &parts)
+      .expect("aligned counts should pass");
   }
 }
