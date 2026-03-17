@@ -16710,14 +16710,30 @@ fn cleanup_unbound_run_dirs_for_task(
   let bound_instances: HashSet<String> = context
     .db
     .with_conn(|conn| {
+      let mut set = HashSet::new();
+      // 收集工作流实例绑定的 run 目录
       let mut stmt = conn.prepare("SELECT instance_id FROM workflow_instances WHERE task_id = ?1")?;
       let rows = stmt.query_map([task_id], |row| row.get::<_, String>(0))?;
-      let mut set = HashSet::new();
       for row in rows {
         let instance_id = row?;
         let normalized = sanitize_filename(instance_id.trim());
         if !normalized.is_empty() {
           set.insert(normalized);
+        }
+      }
+      // 收集 merged_video 引用的 run 目录（路径格式：{task_id}/runs/{instance_id}/...）
+      let mut stmt2 = conn.prepare("SELECT video_path FROM merged_video WHERE task_id = ?1 AND video_path IS NOT NULL AND video_path != ''")?;
+      let paths = stmt2.query_map([task_id], |row| row.get::<_, String>(0))?;
+      for path in paths {
+        let video_path = path?;
+        // 从路径中提取 runs/{instance_id} 部分，格式: {task_id}/runs/{instance_id}/...
+        let normalized_path = video_path.replace('\\', "/");
+        let parts: Vec<&str> = normalized_path.splitn(5, '/').collect();
+        if parts.len() >= 3 && parts[1] == "runs" {
+          let instance_dir = sanitize_filename(parts[2].trim());
+          if !instance_dir.is_empty() {
+            set.insert(instance_dir);
+          }
         }
       }
       Ok(set)
